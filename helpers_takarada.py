@@ -640,3 +640,42 @@ def simulate_pulz(K, rho, phys_parameters, include_hartree, perturbation_operato
         rho = rho_next
 
     return ts, rho_expvals
+
+def susceptibility(time, signal, probe, Gamma, omega_cut, Nk):
+    dt = time[1] - time[0]
+    window = np.exp(- 2 * Gamma * time)
+
+    signal_omega = np.fft.fft((signal - signal[0]) * window * dt)
+    probe_omega = np.fft.fft(probe * window * dt)
+    omega = 2 * np.pi * np.fft.fftfreq(len(time), d=dt)
+
+    pos = (omega > 0) * (omega < omega_cut)
+    omega = omega[pos]
+    signal_omega = signal_omega[pos]
+    probe_omega = probe_omega[pos]
+
+    chi = signal_omega / probe_omega / Nk
+
+    return omega, chi  
+
+def optical_conductivity(time, signal_tok, probe, Gamma, omega_cut, Nk):
+    omega, signal_omega = susceptibility(time, signal_tok, probe, Gamma, omega_cut, Nk)
+    sigma_omega = signal_omega / (-1j * omega)
+    return omega, sigma_omega.real
+
+def sum_rule_rhs(tok, vecs, fs, energije):
+    Nk = tok.shape[-1]
+    tok_tilde = operator_tilde(tok, vecs)
+
+    suma = 0.
+    for n in range(Nk):
+        for a in range(2):
+            for b in range(2):
+                if a != b:
+                    suma += - np.abs(tok_tilde[a,b,n])**2 * (fs[b,b,n] - fs[a,a,n]) / (energije[b,n] - energije[a,n])
+    suma = np.pi / 2 * suma / Nk
+    
+    return suma
+
+def integral_sigma_omega(sigma, omega):
+    return np.trapezoid(sigma.real, omega)
