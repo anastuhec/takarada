@@ -12,6 +12,7 @@ class model:
         self.parameters1 = parameters1
         self.parameters2 = parameters2
         self.phys_parameters = phys_parameters
+        self.hk0 = h_k0(self.K, self.phys_parameters)
 
         self.mu = mu0
 
@@ -38,7 +39,7 @@ class model:
 
     def GS(self):
         _, _, _, _, _, _, Vb, Vc, _ = self.phys_parameters
-        rho, err, energije, vecs, fs, n = Rho_next(rho0(self.Nk), self.K, 0, self.mu, self.phys_parameters, self.parameters1['eps0'],
+        rho, err, energije, vecs, fs, n = Rho_next(self.hk0, rho0(self.Nk), self.K, 0, self.mu, self.phys_parameters, self.parameters1['eps0'],
                                                   self.parameters1['epsilon_threshold'], self.parameters1['N_epsilon'], self.parameters1['maxiter'], self.include_hartree, mix=0.5)
         self.rho = rho
         self.energije = energije
@@ -48,7 +49,6 @@ class model:
         self.n = n
         self.delta_b, self.delta_c = Delta(self.K, self.rho, Vb, Vc)
         self.gap = np.min(self.energije[1]) - np.max(self.energije[0])
-
         #print(f'found ground state, err={err}, n_err={np.abs(n-1)}, phi={self.phi}')
 
     def next_T(self, T, i, show_print=None) -> None:
@@ -62,10 +62,9 @@ class model:
         epsilon_threshold = parameters['epsilon_threshold']
         N_epsilon = parameters['N_epsilon']
         maxiter = parameters['maxiter']
-        n_pass = parameters['n_pass']
         
         mu = NewMu2(self.mu - dmu, self.mu + dmu, self.rho, self.K, T, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, mix=0.5, xtol=1e-6, rtol=1e-6, maxiterbrentq=100)
-        rho, err, energije, vecs, fs, n = Rho_next(self.rho, self.K, T, mu, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, mix=0.5)
+        rho, err, energije, vecs, fs, n = Rho_next(self.hk0, self.rho, self.K, T, mu, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, mix=0.5)
         
         self.rho = rho
         self.energije = energije
