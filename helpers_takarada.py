@@ -1066,3 +1066,51 @@ np.save('sigma_omegas2f.npy', np.array(sigma_omegas2f))
 
 np.save('sigma_omegas2.npy', np.array(sigma_omegas2))
 np.save('sigma_omegas2f.npy', np.array(sigma_omegas2f))
+
+
+
+fig, ax = plt.subplots(ncols=3, figsize=(13,4))
+c1, c2 = 'dodgerblue', 'tomato'
+ax[0].plot(time_f, measurements_f[:,0].real - measurements_f[0,0].real, label='HF frozen', color=c1, lw=3)
+ax[0].plot(time, measurements[:,0].real - measurements[0,0].real, label='HF dynamic', color=c2)
+
+leg = ax[0].legend(frameon=False)
+for text, line in zip(leg.get_texts(), leg.get_lines()):
+    text.set_color(line.get_color())
+
+maxima, maxim_vals = local_minima(measurements_f[:,0].real)
+minima, minim_vals = local_maxima(measurements_f[:,0].real)
+
+t_maxima = time_f[maxima][2:-2]
+t_minima = time_f[minima][1:-2]
+val_maxima = maxim_vals[2:-2]
+val_minima = minim_vals[1:-2]
+ax[0].scatter(t_maxima, val_maxima, color='black')
+ax[0].scatter(t_minima, val_minima, marker='x', color='blue')
+
+k_max, n_max = np.polyfit(np.log(t_maxima), np.log(np.abs(val_maxima)), 1)
+k_min, n_min = np.polyfit(np.log(t_minima), np.log(np.abs(val_minima)), 1)
+ax[1].plot(np.log(t_maxima), np.log(np.abs(val_maxima)), 'o', color='black', label=rf'maxima: slope$={np.round(k_max, 5)}$')
+ax[1].plot(np.log(t_minima), np.log(np.abs(val_minima)), 'x', color='blue', label=rf'minima: slope$={np.round(k_min, 5)}$')
+leg = ax[1].legend(frameon=False)
+
+for text, line in zip(leg.get_texts(), leg.get_lines()):
+    text.set_color(line.get_color())
+
+maxima, maxim_vals = local_minima(measurements[:,0].real)
+minima, minim_vals = local_maxima(measurements[:,0].real)
+
+t_maxima = time[maxima][2:-2]
+t_minima = time[minima][1:-2]
+val_maxima = maxim_vals[2:-2]
+val_minima = minim_vals[1:-2]
+ax[0].scatter(t_maxima, val_maxima, color='maroon')
+ax[0].scatter(t_minima, val_minima, marker='x', color='red')
+k_max, n_max = np.polyfit(np.log(t_maxima), np.log(np.abs(val_maxima)), 1)
+k_min, n_min = np.polyfit(np.log(t_minima), np.log(np.abs(val_minima)), 1)
+ax[2].plot(np.log(t_maxima), np.log(np.abs(val_maxima)), 'o', color='maroon', label=rf'maxima: slope$={np.round(k_max, 5)}$')
+ax[2].plot(np.log(t_minima), np.log(np.abs(val_minima)), 'x', color='red', label=rf'minima: slope$={np.round(k_min, 5)}$')
+leg = ax[2].legend(frameon=False)
+
+for text, line in zip(leg.get_texts(), leg.get_lines()):
+    text.set_color(line.get_color())
