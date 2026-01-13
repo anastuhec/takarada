@@ -902,3 +902,167 @@ def chi_j_j2(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma, N
         chi_j_rho
     )
     return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho
+
+
+
+
+
+#####
+
+
+import numpy as np
+from helpers_takarada import * 
+from module_takarada import *
+
+''' numerical parameters '''
+parameters1 = {'n_pass' : 1e-4,
+'epsilon_threshold' : 1e-8,
+'N_epsilon' : 5,
+'maxiter' : 1000,
+'eps_last' : 1e-8,
+'dmu' : 5.,
+'mix2' : 0.001,
+'mix3' : 1.5,
+'faktor1' : 0.1,
+'max_trials' : 15,
+'eps0' : 0.01,
+}
+
+parameters2 = {'n_pass' : 1e-4,
+'epsilon_threshold' : 1e-8,
+'N_epsilon' : 5,
+'maxiter' : 1000,
+'eps_last' : 1e-8,
+'dmu' : 5.,
+'mix2' : 0.001,
+'mix3' : 1.5,
+'faktor1' : 0.1,
+'max_trials' : 15,
+'eps0' : 0.01,
+}
+
+''' physical parameters '''
+a = 1.
+b = 0.5
+
+t12 = 0.
+delta = 0.
+
+t = 1.
+t_ = 0.5
+Vc = 0.5
+Vb = 2.
+
+gap = -2
+epsilon = 0.5*(gap + 2*t_ + 2*t)
+epsilon_ = epsilon
+
+phys_parameters = [b, t, t_, t12, epsilon, epsilon_, Vb, Vc, delta]
+
+mu0 = 0.
+include_hartree = False
+
+Nk = 1000
+''' create model, find ground state, heat system a bit '''
+m = model(Nk, mu0, phys_parameters, parameters1, parameters2, include_hartree)
+m.GS()
+
+beta0 = 50
+scale = 1.005
+betas = beta0/scale**np.arange(1,21)
+stops = [int(np.emath.logn(scale, beta0/beta)) for beta in betas]
+Ts = 1/betas
+Gamma = 0.005
+Nomega = 21
+eps = 0.1
+m.run2(betas, stops, Gamma, Nomega, eps)
+
+''' couple current to magnetic potential, measure expectation value of current '''
+t0 = 2.
+sigma = 0.02
+dt = 0.005
+Omega = 0.
+A0 = 0.01
+
+geom, phases = input_data(m.K, phys_parameters, m.mu)
+g_ffts = G_ffts(phases, m.Nk)
+tok = j_tok(m.K, phys_parameters, m.mu)
+rhos, thetas = rho_operators(m.K, phys_parameters, include_hartree)
+
+perturbation_operator = tok
+measure_operators = tok
+
+t_max = 250
+Ncorr = 10
+tol = 1e-8
+
+T = m.Ts[-1]
+fs = np.zeros(())
+
+do_freeze = True
+time_f, measurements_f = simulate_pulz(m.K, m.hk0, m.rho, phys_parameters, include_hartree, perturbation_operator, measure_operators,
+                                       A0, t0, sigma, Omega, dt, t_max, do_freeze, Ncorr, tol,
+                                       geom, phases, g_ffts)
+np.save('time_f.npy', time_f)
+np.save('measurements_f.npy', measurements_f[:,0].real)
+
+do_freeze = False
+time, measurements = simulate_pulz(m.K, m.hk0, m.rho, phys_parameters, include_hartree, perturbation_operator, measure_operators,
+                                   A0, t0, sigma, Omega, dt, t_max, do_freeze, Ncorr, tol,
+                                   geom, phases, g_ffts)
+np.save('time.npy', time)
+np.save('measurements.npy', measurements[:,0].real)
+
+
+calculate optical conductivity from it 
+etas = [0.001, 0.003, 0.006, 0.008, 0.01]
+omega_cut = 150*m.gap
+pulz = A_pulz(time_f, A0, t0, sigma, Omega)
+
+sigma_omegas1 = []
+sigma_omegas1f = []
+for i, eta in enumerate(etas):
+    print(i)
+    omega, sigma_omega1f = optical_conductivity(time_f, measurements_f[:,0], pulz, eta, omega_cut, m.Nk)
+    omega, sigma_omega1 = optical_conductivity(time, measurements[:,0], pulz, eta, omega_cut, m.Nk)
+    sigma_omegas1.append(sigma_omega1)
+    sigma_omegas1f.append(sigma_omega1f)
+np.save('omegas.npy', omega)
+np.save('sigma_omegas1.npy', np.array(sigma_omegas1))
+np.save('sigma_omegas1f.npy', np.array(sigma_omegas1f))
+
+tok_tilde = operator_tilde(m.tok, m.vecs)
+rhos_tilde = operator_tilde(rhos, m.vecs)
+
+
+Gammas = [0.001, 0.005, 0.01]
+T = m.Ts[-1]
+
+
+omega = np.linspace(0.01, 1.5, 101) * m.gap
+sigma_omegas2 = np.zeros((len(Gammas), len(omega)))
+sigma_omegas2f = np.copy(sigma_omegas2)
+sigma_omegas3 = np.copy(sigma_omegas2)
+sigma_omegas3f = np.copy(sigma_omegas2)
+
+
+for i, Gamma in enumerate(Gammas):
+    print(i)
+    chi_jj, dchi_j_j, chi_rh_rh, chi_rho_j = chi_j_j(m.K, tok_tilde, rhos_tilde, thetas, m.energije, m.mu, T, omega, Gamma)
+    #chi_jj2, dchi_j_j2, chi_rh_rh2, chi_rho_j2 = chi_j_j2(m.K, tok_tilde, rhos_tilde, thetas, m.energije, m.mu, T, omega, Gamma)
+    sigma_omega2f = chi_jj.imag / omega
+    sigma_omega2 = (chi_jj + dchi_j_j).imag / omega
+
+    sigma_omega3f = chi_jj2.imag / omega
+    sigma_omega3 = (chi_jj2 + dchi_j_j2).imag / omega
+
+    sigma_omegas2f[i] = sigma_omega2f
+    sigma_omegas2[i] = sigma_omega2
+    sigma_omegas3f[i] = sigma_omega3f
+    sigma_omegas3[i] = sigma_omega3
+
+np.save('sigma_omegas2.npy', np.array(sigma_omegas2))
+np.save('sigma_omegas2f.npy', np.array(sigma_omegas2f))
+
+np.save('sigma_omegas2.npy', np.array(sigma_omegas2))
+np.save('sigma_omegas2f.npy', np.array(sigma_omegas2f))
