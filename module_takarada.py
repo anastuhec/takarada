@@ -13,6 +13,7 @@ class model:
         self.parameters2 = parameters2
         self.phys_parameters = phys_parameters
         self.hk0 = h_k0(self.K, self.phys_parameters)
+        self.tok = j_tok(self.K, self.phys_parameters, 0)
 
         self.mu = mu0
 
@@ -49,6 +50,10 @@ class model:
         self.n = n
         self.delta_b, self.delta_c = Delta(self.K, self.rho, Vb, Vc)
         self.gap = np.min(self.energije[1]) - np.max(self.energije[0])
+
+        self.mu = 0.5 * (np.min(self.energije[1]) + np.max(self.energije[0]))
+        self.geom, self.phases = input_data(self.K, self.phys_parameters, self.mu)
+        self.g_ffts = G_ffts(self.phases, self.Nk)
         #print(f'found ground state, err={err}, n_err={np.abs(n-1)}, phi={self.phi}')
 
     def next_T(self, T, i, show_print=None) -> None:
@@ -62,10 +67,11 @@ class model:
         epsilon_threshold = parameters['epsilon_threshold']
         N_epsilon = parameters['N_epsilon']
         maxiter = parameters['maxiter']
+        n_pass = parameters['n_pass']
         
-        mu = NewMu2(self.mu - dmu, self.mu + dmu, self.rho, self.K, T, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, mix=0.5, xtol=1e-6, rtol=1e-6, maxiterbrentq=100)
-        rho, err, energije, vecs, fs, n = Rho_next(self.hk0, self.rho, self.K, T, mu, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, mix=0.5)
-        
+        mu = NewMu2(self.mu - dmu, self.mu + dmu, self.hk0, self.rho, self.K, T, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, self.include_hartree, mix=0.5, xtol=n_pass, rtol=1e-6, maxiterbrentq=100)
+        rho, err, energije, vecs, fs, n = Rho_next(self.hk0, self.rho, self.K, T, mu, self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, self.include_hartree, mix=0.5)
+    
         self.rho = rho
         self.energije = energije
         self.fs = fs
@@ -95,6 +101,7 @@ class model:
                 self.next_T(T, 2, show_print)
 
     def run2(self, betas, stops, Gamma, Nomega, eps):
+        print('started')
         for i, beta in enumerate(betas):
             T = 1/beta
             if i not in stops:
@@ -123,20 +130,14 @@ class model:
                 omega_max = np.sqrt(np.abs(np.arccosh(1/(eps*4*T))) * 2 * T)
                 omegas = np.linspace(-omega_max, omega_max, Nomega)
 
-                spektralka = Spektralka(omegas, self.mu, self.energije, Gamma, )
-                tok = j_tok(self.K, self.phys_parameters, self.mu)
-                tok_tilde = np.einsum('ijx,jlx,mlx -> imx', self.vecs, tok, self.vecs.conj())
+                spektralka = Spektralka(omegas, self.mu, self.energije, Gamma)
+
+                tok_tilde = operator_tilde(self.tok, self.vecs)
                 phi = phi_Kubo(self.K, tok_tilde, tok_tilde, spektralka, omegas)
 
-                m1 = mf_matrix1(self.K, self.rho, self.phys_parameters, self.mu)
-                m1_tilde = np.einsum('ijx,jlx,mlx -> imx', self.vecs, m1, self.vecs.conj())
-                m2 = mf_matrix2(self.K, self.rho, self.phys_parameters, self.mu)
-                m2_tilde = np.einsum('ijx,jlx,mlx -> imx', self.vecs, m2, self.vecs.conj())
-                m3 = mf_matrix3(self.K, self.rho, self.phys_parameters, self.mu)
-                m3_tilde = np.einsum('ijx,jlx,mlx -> imx', self.vecs, m3, self.vecs.conj())
-                m4 = mf_matrix4(self.K, self.rho, self.phys_parameters, self.mu)
-                m4_tilde = np.einsum('ijx,jlx,mlx -> imx', self.vecs, m4, self.vecs.conj())
-                phiQ = phi_Kubo(self.K, m1_tilde + m2_tilde + m3_tilde + m4_tilde, tok_tilde, spektralka, omegas)
+                mat = compute_all_mf_matrices(self.K, self.rho, self.geom, self.phases, self.g_ffts)
+                mat_tilde = operator_tilde(mat, self.vecs)
+                phiQ = phi_Kubo(self.K, mat_tilde, tok_tilde, spektralka, omegas)
 
                 K0 = np.pi * np.sum(phi.real * (-fd_1(omegas, T))) * (omegas[1] - omegas[0])
                 K1 = np.pi * np.sum(omegas * phi.real * (-fd_1(omegas, T))) * (omegas[1] - omegas[0])
