@@ -3,27 +3,32 @@ import scipy.linalg as LA
 from numba import njit, prange
 from scipy.optimize import brentq
 
-''' analytic result for energy bands IF t12 = 0 '''
-def E_analytic(K, rho, phys_parameters):
-    _, t, t_, _, epsilon, epsilon_, Vb, Vc, _ = phys_parameters
-    Nk = len(K)
-    delta_k = -Vb/Nk*np.sum(rho[1,0,:]) - Vc/Nk*np.sum(rho[1,0,:]*np.exp(-1j*K)) * np.exp(-1j*K)
-    E_minus = (t-t_)*np.cos(K) - np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
-    E_plus = (t-t_)*np.cos(K) + np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
-    return np.vstack([E_minus, E_plus])
+# ====== self-consistency calculation ======
 
-''' analytic result for group velocities IF t12 = 0 '''
-def v_analytic(K, rho, phys_parameters):
-    _, t, t_, _, epsilon, epsilon_, Vb, Vc, _ = phys_parameters
-    Nk = len(K)
+@njit(cache=True)
+def parameters(b, t, t_, t12, epsilon, epsilon_, Vb, Vc, mu, delta=0):
+    kinetic = np.array([
+        (1, 0, 0, t),
+        (-1, 0, 0, t),
+        (1, 1, 1, -t_),
+        (-1, 1, 1, -t_),
+        (0, 0, 1, t12 + delta),
+        (-1, 0, 1, t12 - delta),
+        (0, 1, 0, t12 + delta),
+        (1, 1, 0, t12 - delta),
+        (0, 0, 0, epsilon - mu),
+        (0, 1, 1, epsilon_ - mu)
+    ])
 
-    delta_b = -Vb/Nk*np.sum(rho[1,0,:])
-    delta_c = -Vc/Nk*np.sum(rho[1,0,:]*np.exp(-1j*K))
-    delta_k = delta_b + delta_c*np.exp(-1j*K)
+    interaction = np.array([
+        (0, 0, 1, Vb / 2),
+        (0, 1, 0, Vb / 2),
+        (1, 0, 1, Vc / 2),
+        (-1, 1, 0, Vc / 2)
+    ])
 
-    vel_minus = -(t-t_)*np.sin(K) - (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
-    vel_plus = -(t-t_)*np.sin(K) + (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
-    return np.vstack([vel_minus, vel_plus])
+    pos = np.array([0.0, b])
+    return pos, kinetic, interaction
 
 def rho0(Nk):
     rho = np.zeros((2, 2, Nk))
@@ -124,54 +129,52 @@ def Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0,
     energije, vecs, fs = diagonalize(h_k(K, hk0, rho, phys_parameters, 0., include_hartree), K, T, mu)
     return rho, err, energije, vecs, fs, zasedenost(rho)
 
-def Rho_next2(hamiltonian, rho, K, T, mu,
-             epsilon_threshold, maxiter, mix=0.5):
-    err, N_iters = 1, 0
-    while err > epsilon_threshold and N_iters < maxiter:
-        rho_new, err = F(hamiltonian, rho, K, T, mu)
-        rho = rho_new * mix + rho * (1 - mix)
-        N_iters += 1
-    rho, _ = F(hamiltonian, rho, K, T, mu)
-    energije, vecs, fs = diagonalize(hamiltonian, K, T, mu)
-    return rho, err, energije, vecs, fs, zasedenost(rho)
-
-
 def f_newmu(mu, hk0, rho, K, T, phys_parameters, eps0,
              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5):
     _, _, _, _, _, n = Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0,
              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)
     return n - 1
 
-
 def NewMu2(mu1, mu2, hk0, rho, K, T, phys_parameters, eps0,
              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, xtol=1e-10, rtol=1e-10, maxiterbrentq=100):
     return brentq(f_newmu, mu1, mu2, args=(hk0, rho, K, T, phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, include_hartree, mix), 
                    xtol=xtol, rtol=rtol, maxiter=maxiterbrentq, full_output=False)
 
-@njit(cache=True)
-def parameters(b, t, t_, t12, epsilon, epsilon_, Vb, Vc, mu, delta=0):
-    kinetic = np.array([
-        (1, 0, 0, t),
-        (-1, 0, 0, t),
-        (1, 1, 1, -t_),
-        (-1, 1, 1, -t_),
-        (0, 0, 1, t12 + delta),
-        (-1, 0, 1, t12 - delta),
-        (0, 1, 0, t12 + delta),
-        (1, 1, 0, t12 - delta),
-        (0, 0, 0, epsilon - mu),
-        (0, 1, 1, epsilon_ - mu)
-    ])
+''' analytic result for energy bands IF t12 = 0 and delta = 0 and epsilon_ = epsilon '''
+def E_analytic(K, rho, phys_parameters):
+    _, t, t_, _, epsilon, _, Vb, Vc, _ = phys_parameters
+    Nk = len(K)
+    delta_k = -Vb/Nk*np.sum(rho[1,0,:]) - Vc/Nk*np.sum(rho[1,0,:]*np.exp(-1j*K)) * np.exp(-1j*K)
+    E_minus = (t-t_)*np.cos(K) - np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
+    E_plus = (t-t_)*np.cos(K) + np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
+    return np.vstack([E_minus, E_plus])
 
-    interaction = np.array([
-        (0, 0, 1, Vb / 2),
-        (0, 1, 0, Vb / 2),
-        (1, 0, 1, Vc / 2),
-        (-1, 1, 0, Vc / 2)
-    ])
 
-    pos = np.array([0.0, b])
-    return pos, kinetic, interaction
+
+# ====== transport ======
+
+''' operator in band basis obtained from operator in orbital basis '''
+def operator_tilde(op_bare, vecs):
+    op_tilde = np.empty_like(op_bare, dtype=np.complex128)
+    if len(op_tilde.shape) > 3:
+        # this means there are multiple operators
+        n_ops = op_tilde.shape[0]
+        for n in range(n_ops):
+            op_tilde[n] = np.einsum('jix, jlx, lmx -> imx', vecs.conj(), op_bare[n], vecs)
+    else:
+        op_tilde = np.einsum('jix, jlx, lmx -> imx', vecs.conj(), op_bare, vecs)
+    return op_tilde
+
+''' analytic result for group velocities IF t12 = 0 and delta = 0 and epsilon_ = epsilon '''
+def v_analytic(K, rho, phys_parameters):
+    _, t, t_, _, epsilon, _, Vb, Vc, _ = phys_parameters
+
+    delta_b, delta_c = Delta(K, rho, Vb, Vc)
+    delta_k = delta_b + delta_c*np.exp(-1j*K)
+
+    vel_minus = -(t-t_)*np.sin(K) - (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
+    vel_plus = -(t-t_)*np.sin(K) + (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
+    return np.vstack([vel_minus, vel_plus])
 
 @njit(cache=True)
 def j_tok(K, phys_parameters, mu):
@@ -386,10 +389,10 @@ def phi_Kubo_diagonal(K, mat1, mat2, spektralka, omegas):
             phi += (mat1[a,a,m] * A[:,a,m] * mat2[a,a,m] * A[:,a,m]).real
     for m in prange(1,Nk//2):
         for a in range(2):
-            phi += (mat1[a,a,m] * A[:,a,m] * mat2[a,a,m] * A[:,a,m]).real
+            phi += 2 * (mat1[a,a,m] * A[:,a,m] * mat2[a,a,m] * A[:,a,m]).real
     return phi / Nk
 
-''' df/domega, f je Fermi-Diracova porazdelitvena funkcija '''
+''' df/domega, f is Fermi-Dirac distribution function '''
 @njit(cache=True)
 def fd_1(omega, T): return -1/(4*T)/np.cosh(omega/(2*T))**2
 
@@ -402,8 +405,8 @@ def delta_approximation(x, width, shape='Gaussian'):
 def phi_Boltzmann(K, rho, phys_parameters, energije, mu, omegas, faktor=0.2, shape='Gaussian'):
     Nk = len(K)
     phi = np.zeros(len(omegas))
-    _, _, _, t12, _, _, _, _, _ = phys_parameters
-    if t12 == 0:
+    _, _, _, t12, epsilon, epsilon_, _, _, delta = phys_parameters
+    if epsilon == epsilon_ and t12 == 0 and delta == 0:
         vel = v_analytic(K, rho, phys_parameters)
     else:
         vel1 = np.diff(energije[0]) / (K[1] - K[0])
@@ -436,9 +439,7 @@ def Kn_boltz(K, energije, mu, T):
     for j in range(1,Nk//2):
         K0 += 2 * (-fd_1(energije[0,j] - mu, T) * vel1[j]**2 - fd_1(energije[1,j] - mu, T) * vel2[j]**2)
         K1 += 2 * (-fd_1(energije[0,j] - mu, T) * vel1[j]**2 * (energije[0,j] - mu) - fd_1(energije[1,j] - mu, T) * vel2[j]**2 * (energije[1,j] - mu))
-
     return K0 / Nk, K1 / Nk
-
 
 sigmas = np.zeros((4, 2, 2), dtype=np.complex128)
 sigmas[0] = np.eye(2)
@@ -448,7 +449,7 @@ sigmas[3] = np.diag([1,-1])
 
 def rho_operators(K, phys_parameters, include_hartree):
 
-    b, _, _, _, _, _, Vb, Vc, _ = phys_parameters
+    _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
 
     if include_hartree == True:
         thetas = np.hstack([[Vb/2, -Vb/2, -Vb/2, -Vb/2],
@@ -477,6 +478,18 @@ def rho_operators(K, phys_parameters, include_hartree):
             rhos[ind] = Rho
     return rhos, thetas
 
+''' Fermi-Dirac function '''
+@njit
+def fd(eps, mu, T):
+    return 1.0 / (np.exp((eps - mu) / T) + 1.0)
+
+''' a bubble (just propagators, no operator vertices attached) needed for susceptibilities
+this form does not perform well numerically in the omega --> 0 limit '''
+@njit(cache=True)
+def Pi_bubble0(omega, E_mk, E_nk, Gamma, mu, T):
+    return - (fd(E_mk, mu, T) - fd(E_nk, mu, T)) / (omega + E_mk - E_nk + 1j*2*Gamma)
+
+''' susceptibility between U and V, using bubble  Pi0 '''
 @njit(parallel=True, cache=True)
 def chi_UV0(K, mat1, mat2, omegas, energije, mu, T, Gamma):
     Nk = len(K)
@@ -491,43 +504,12 @@ def chi_UV0(K, mat1, mat2, omegas, energije, mu, T, Gamma):
                 for b in range(2):
                     if a != b:
                         suma_w += mat1[a,b,m] * mat2[b,a,m] * Pi_bubble0(w, energije[a,m], energije[b,m], Gamma, mu, T)
-
         phi[iw] = suma_w
     return phi / Nk
 
-def operator_tilde(op_bare, vecs):
-    op_tilde = np.empty_like(op_bare, dtype=np.complex128)
-    if len(op_tilde.shape) > 3:
-        # this means there are multiple operators
-        n_ops = op_tilde.shape[0]
-        for n in range(n_ops):
-            op_tilde[n] = np.einsum('jix, jlx, lmx -> imx', vecs.conj(), op_bare[n], vecs)
-    else:
-        op_tilde = np.einsum('jix, jlx, lmx -> imx', vecs.conj(), op_bare, vecs)
-    return op_tilde
-
-def chi_rho_rho(K, rhos, thetas, vecs, energije, mu, T, omegas, Gamma):
-    thetas = np.diag(thetas)
-    rhos_tilde = operator_tilde(rhos, vecs)
-
-    Nop = rhos_tilde.shape[0]
-    Nw = len(omegas)
-
-    chi_rho_rho = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
-    for i in range(Nop):
-        for j in range(Nop):
-            chi_rho_rho[i,j] = chi_UV0(K, rhos_tilde[i], rhos_tilde[j], omegas, energije, mu, T, Gamma)
-
-    chi_rho_rho_renormalized = np.empty_like(chi_rho_rho)
-    I = np.eye(Nop, dtype=np.complex128)
-
-    for iw in range(Nw):
-        inv = LA.inv(I - chi_rho_rho[:,:,iw] @ thetas)
-        chi_rho_rho_renormalized[:,:,iw] = inv @ chi_rho_rho[:,:,iw]
-
-    return chi_rho_rho, chi_rho_rho_renormalized
-
-def chi_j_j(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma):
+''' current-current, current-density, density-density corrections using a simpler bubble (Pi_bubble0, chi_UV0),
+including their corrections '''
+def chi_jrho(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma):
     thetas = np.diag(thetas)
 
     Nop = rhos_tilde.shape[0]
@@ -549,8 +531,11 @@ def chi_j_j(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma):
 
     inverz = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
     I = np.eye(Nop, dtype=np.complex128)
+    chi_rho_rho_renorm = np.empty_like(chi_rho_rho, dtype=np.complex128)
     for i in range(Nw):
-        inverz[:,:,i] = LA.inv(I - chi_rho_rho[:,:,i] @ thetas)
+        inv = LA.inv(I - chi_rho_rho[:,:,i] @ thetas)
+        inverz[:,:,i] = inv
+        chi_rho_rho_renorm[:,:,i] = inv @ chi_rho_rho[:,:,i]
 
     dchi_j_j = np.einsum(
         'aw,ab,bcw,cw->w',
@@ -559,11 +544,124 @@ def chi_j_j(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma):
         inverz,
         chi_j_rho
     )
-    return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho
+    return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho, chi_rho_rho_renorm
 
+''' retarded Green's function '''
+@njit
+def G_R(epsilon, E, Gamma):
+    return 1. /(epsilon - E + 1j*Gamma)
+
+''' advanced Green's function '''
+@njit
+def G_A(epsilon, E, Gamma):
+    return 1. /(epsilon - E - 1j*Gamma)
+
+''' (single-particle) spectral function '''
+@njit
+def A_k(epsilon, E, Gamma):
+    return 1/np.pi * Gamma  / ( (epsilon - E)**2 + Gamma**2 )
+
+''' susceptibility between U and V, using bubble  Pi '''
+@njit(cache=True)
+def Pi_bubble(omega, E_mk, E_nk, Gamma, mu, T, width, deps):
+    eps_min = min(E_mk, E_nk - omega, mu) - width
+    eps_max = max(E_mk, E_nk - omega, mu) + width
+    Npts = int((eps_max - eps_min) / deps)
+    chi_mn = 0.0 + 1j*0.0
+    chi_nm = 0.0 + 1j*0.0
+    for i in range(Npts):
+        eps = eps_min + i * deps
+        
+        # first term
+        f = fd(eps, mu, T)
+        # first term, mn
+        chi_mn += A_k(eps, E_mk, Gamma) * G_R(eps + omega, E_nk, Gamma) * f
+        # first term, nm
+        chi_nm += A_k(eps, E_nk, Gamma) * G_R(eps + omega, E_mk, Gamma) * f
+
+        # second term
+        fw = fd(eps + omega, mu, T)
+        # second term, mn
+        chi_mn += A_k(eps + omega, E_nk, Gamma) * G_A(eps, E_mk, Gamma) * fw
+        # second term, nm
+        chi_nm += A_k(eps + omega, E_mk, Gamma) * G_A(eps, E_nk, Gamma) * fw
+
+    chi_mn = chi_mn * deps
+    chi_nm = chi_nm * deps
+    return - chi_mn, - chi_nm
+
+
+@njit(parallel=True, cache=True)
+def chi_UV(K, U, V, omegas, energije, Gamma, mu, T, N=15, factor=5):
+    Nk = len(K)
+    Nw = len(omegas)
+    width = N * max(Gamma, T)
+    deps = min(Gamma, T) / factor
+    chi = np.zeros(Nw, dtype=np.complex128)
+
+    for iw in prange(Nw):
+        w = omegas[iw]
+        for j in range(Nk):
+            for m in range(2):
+                for n in range(m,2):
+                    U_mnk = U[m,n,j]
+                    U_nmk = U[n,m,j]
+                    V_mnk = V[m,n,j]
+                    V_nmk = V[n,m,j]
+                    pi_mnk, pi_nmk = Pi_bubble(w, energije[m,j], energije[n,j], Gamma, mu, T, width, deps)
+                    if m == n:
+                        chi[iw] += 0.5 * (U_mnk * V_nmk * pi_mnk + U_nmk * V_mnk * pi_nmk)
+                    else:
+                        chi[iw] += U_mnk * V_nmk * pi_mnk + U_nmk * V_mnk * pi_nmk
+    return chi / Nk
+''' current-current, current-density, density-density corrections using a more complicated bubble (Pi_bubble, chi_UV),
+including their corrections '''
+def chi_jrho2(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma, N=15, factor=5):
+    thetas = np.diag(thetas)
+
+    Nop = rhos_tilde.shape[0]
+    Nw = len(omegas)
+
+    ''' chi_j_j is bare current-current susceptibility (bubble) '''
+    chi_j_j = chi_UV(K, tok_tilde, tok_tilde, omegas, energije, Gamma, mu, T, N, factor)
+
+    ''' below we construct dchi_j_j, which is correction of the bubble,
+    for this we need rho-current and rho-rho susceptibilities in terms of bubbles '''
+    chi_rho_rho = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
+    chi_rho_j = np.zeros((Nop, Nw), dtype=np.complex128)
+    chi_j_rho = np.zeros((Nop, Nw), dtype=np.complex128)
+    for i in range(Nop):
+        chi_rho_j[i] = chi_UV(K, tok_tilde, rhos_tilde[i], omegas, energije, Gamma, mu, T, N, factor)
+        chi_j_rho[i] = chi_UV(K, rhos_tilde[i], tok_tilde, omegas, energije, Gamma, mu, T, N, factor)
+        for j in range(Nop):
+            chi_rho_rho[i,j] = chi_UV(K, rhos_tilde[i], rhos_tilde[j], omegas, energije, Gamma, mu, T, N, factor)
+
+    inverz = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
+    I = np.eye(Nop, dtype=np.complex128)
+    chi_rho_rho_renorm = np.empty_like(chi_rho_rho, dtype=np.complex128)
+    for i in range(Nw):
+        inv = LA.inv(I - chi_rho_rho[:,:,i] @ thetas)
+        inverz[:,:,i] = inv
+        chi_rho_rho_renorm[:,:,i] = inv @ chi_rho_rho[:,:,i]
+
+    dchi_j_j = np.einsum(
+        'aw,ab,bcw,cw->w',
+        chi_rho_j,
+        thetas,
+        inverz,
+        chi_j_rho
+    )
+    return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho, chi_rho_rho_renorm
+
+
+
+# ====== response and susceptibility obtained from simulation of a pulse ======
+
+''' Gaussian pulse modulated by a cosine (in practice, however, I choose Omega=0, i.e. the pulse is a Gaussian ''' 
 def A_pulz(t, A0, t0, sigma, Omega):
     return A0 * np.cos(Omega * t) * np.exp(-(t-t0)**2/(2*sigma**2))
 
+''' evolving rho(t) into rho(t+dt). for 2-band system, this can be done analytically using decomposition of h_k into a linear combination of Pauli matrices '''
 @njit(parallel=True)
 def evolve_rho_kernel(Hk, rho, dt):
     Nk = rho.shape[2]
@@ -608,22 +706,28 @@ def evolve_rho_kernel(Hk, rho, dt):
 
     return rho_next
 
+''' expectation value of measure_operators when system is described by density matrix rho'''
 @njit(parallel=True)
-def measure(Nk, Nop, measure_operators, rho_k):
+def measure(Nk, Nop, measure_operators, rho):
     measurements_k = np.zeros((Nop, Nk), dtype=np.complex128)
     measurements_k = np.zeros((Nop, Nk), dtype=np.complex128)
     for j in prange(Nk):
         for n in range(Nop):
             # Tr[rho_k O_k]
             measurements_k[n, j] = (
-                rho_k[0,0,j]*measure_operators[n,0,0,j] +
-                rho_k[0,1,j]*measure_operators[n,1,0,j] +
-                rho_k[1,0,j]*measure_operators[n,0,1,j] +
-                rho_k[1,1,j]*measure_operators[n,1,1,j]
+                rho[0,0,j]*measure_operators[n,0,0,j] +
+                rho[0,1,j]*measure_operators[n,1,0,j] +
+                rho[1,0,j]*measure_operators[n,0,1,j] +
+                rho[1,1,j]*measure_operators[n,1,1,j]
             )
     measurements = measurements_k.sum(axis=1)
     return measurements
 
+''' main function which propagates the system and measures observables (measure_provider)
+upon application of a perturbation (generated by perturbation_operator)
+* do_freeze=True means that Hartree-Fock is frozen to its equilibrium value, hence we observe no corrections, e.g., in current-current response
+* do_freeze=False is the opposite; Hartree-Fock is dynamic, i.e. densities respond to perturbations, and in this response the vertex corrections are captured
+'''
 def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree, perturbation_operator, measure_provider,
                   A0, t0, sigma, Omega, dt, t_max,
                   do_freeze, Ncorr, tol, geom, phases, g_ffts):
@@ -656,7 +760,7 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree, perturbation_op
 
     for i in range(N_points):
         if i % 50 == 0:
-            print(i/N_points)
+            print(i/N_points, flush=True)
 
         A_t = A_pulz(i * dt, A0, t0, sigma, Omega)
         A_half = A_pulz(i * dt + dt/2, A0, t0, sigma, Omega)
@@ -691,6 +795,7 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree, perturbation_op
 
     return ts, rho_expvals
 
+''' susceptibility obtained from temporal response, using Fourier transform. window exp(-eta*t) is applied '''
 def susceptibility(time, signal, probe, eta, omega_cut, Nk):
     dt = time[1] - time[0]
     window = np.exp(- eta * time)
@@ -707,6 +812,7 @@ def susceptibility(time, signal, probe, eta, omega_cut, Nk):
 
     return omega, signal_omega, probe_omega
 
+''' optical conductivity calculated from susceptibility obtained from temporal response'''
 def optical_conductivity(time, signal, probe, eta, omega_cut, Nk):
     omega, signal_omega, probe_omega = susceptibility(time, signal, probe, eta, omega_cut, Nk)
     sigma_omega = signal_omega / (-1j * omega * probe_omega)
@@ -727,390 +833,31 @@ def sum_rule_rhs(tok_tilde, energije, mu, T):
     return suma
 
 def integral_sigma_omega(sigma, omega):
-    return np.trapz(sigma.real, omega)
-
-
-def solve_Fredholm(K, tok,  omegas, Vs, deltas, Pifull):
-    Nk = len(K)
-    Nw = len(omegas)
-    Nd = len(deltas)
-    lambd = tok[0,1]
-
-    phasesV = np.zeros((Nk, Nd), dtype=np.complex128)
-    for n in range(Nd):
-        phasesV[:,n] = Vs[n] * np.exp(1j*K*deltas[n])
-
-    Lambda = np.zeros((Nw, Nk), dtype=np.complex128)
-
-    for i in range(Nw):
-
-        Pi01w = Pifull[i,0,1,:]
-
-        h = np.zeros(Nd, dtype=np.complex128)
-        C = np.zeros((Nd, Nd), dtype=np.complex128)
-        for n in range(Nd):
-            delta_n = deltas[n]
-            h[n] = np.sum( np.exp(-1j * K * delta_n) * Pi01w * lambd )
-            for m in range(Nd):
-                delta_m = deltas[m]
-                C[n,m] = np.sum( np.exp(-1j * K * (delta_n - delta_m)) * Pi01w) * Vs[m]
-        
-        alpha = LA.solve(np.eye(Nd) + C, h)
-        Lambda[i] = lambd - np.dot(phasesV, alpha )
-
-    return Lambda
-
-@njit
-def fd(eps, mu, T):
-    return 1.0 / (np.exp((eps - mu) / T) + 1.0)
-
-@njit
-def G_R(epsilon, E, Gamma):
-    return 1. /(epsilon - E + 1j*Gamma)
-
-@njit
-def G_A(epsilon, E, Gamma):
-    return 1. /(epsilon - E - 1j*Gamma)
-
-@njit
-def A_k(epsilon, E, Gamma):
-    return 1/np.pi * Gamma  / ( (epsilon - E)**2 + Gamma**2 )
-
-@njit(parallel=True, cache=True)
-def chi_UV(K, U, V, omegas, energije, Gamma, mu, T, N=15, factor=5):
-    Nk = len(K)
-    Nw = len(omegas)
-    width = N * max(Gamma, T)
-    deps = min(Gamma, T) / factor
-    chi = np.zeros(Nw, dtype=np.complex128)
-
-    for iw in prange(Nw):
-        w = omegas[iw]
-        for j in range(Nk):
-            for m in range(2):
-                for n in range(m,2):
-                    U_mnk = U[m,n,j]
-                    U_nmk = U[n,m,j]
-                    V_mnk = V[m,n,j]
-                    V_nmk = V[n,m,j]
-                    pi_mnk, pi_nmk = Pi_bubble(w, energije[m,j], energije[n,j], Gamma, mu, T, width, deps)
-                    if m == n:
-                        chi[iw] += 0.5 * (U_mnk * V_nmk * pi_mnk + U_nmk * V_mnk * pi_nmk)
-                    else:
-                        chi[iw] += U_mnk * V_nmk * pi_mnk + U_nmk * V_mnk * pi_nmk
-    return chi / Nk
-
-@njit(parallel=True, cache=True)
-def Pi_full(K, omegas, energije, Gamma, mu, T, width, deps, vecs):
-    Nk = len(K)
-    Nw = len(omegas)
-    Pi = np.zeros((Nw, 2, 2, Nk), dtype=np.complex128)
-
-    for i in prange(Nw):
-        w = omegas[i]
-        for j in range(Nk):
-            for m in range(2):
-                for n in range(m,2):
-                    pi_mnk, pi_nmk = Pi_bubble(w, energije[m,j], energije[n,j], Gamma, mu, T, width, deps)
-                    if m == n:
-                        Pi[i,m,m,j] = 0.5 * (pi_mnk + pi_nmk)
-                    else:
-                        Pi[i,m,n,j] = pi_mnk
-                        Pi[i,n,m,j] = pi_nmk
-
-    Pi_bare = np.empty_like(Pi, dtype=np.complex128)
-    for j in prange(Nk):
-        U = vecs[:,:,j]
-        u00 = U[0,0]
-        u01 = U[0,1]
-        u10 = U[1,0]
-        u11 = U[1,1]
-        Pi_bare[:,0,0,j] = np.abs(u00) * Pi[:,0,0,j]  + np.abs(u01) * Pi[:,1,1,j]
-        Pi_bare[:,1,1,j] = np.abs(u10) * Pi[:,0,0,j]  + np.abs(u11) * Pi[:,1,1,j]
-        Pi_bare[:,0,1,j] = u00.conjugate() * u10 * Pi[:,0,0,j] + u01.conjugate() * u11 * Pi[:,1,1,j]
-        Pi_bare[:,1,0,j] = Pi[:,0,1,j].conjugate()
-        #c1 = u00 C1 + u01 C2
-        #c2 = u10 C1 + u11 C2
-        #u_dag @ h _ u_dag = diag[E]
-        # u @ diag[E] @ u_dag = h
-        # torej: u_dag @ Psi = tilde[Psi]
-        # Psi = u @ tilde[Psi]
-    return Pi, Pi_bare
-
-@njit(cache=True)
-def Pi_bubble0(omega, E_mk, E_nk, Gamma, mu, T):
-    return - (fd(E_mk, mu, T) - fd(E_nk, mu, T)) / (omega + E_mk - E_nk + 1j*2*Gamma)
-    
-@njit(cache=True)
-def Pi_bubble(omega, E_mk, E_nk, Gamma, mu, T, width, deps):
-    eps_min = min(E_mk, E_nk - omega, mu) - width
-    eps_max = max(E_mk, E_nk - omega, mu) + width
-    Npts = int((eps_max - eps_min) / deps)
-    chi_mn = 0.0 + 1j*0.0
-    chi_nm = 0.0 + 1j*0.0
-    for i in range(Npts):
-        eps = eps_min + i * deps
-        
-        # first term
-        f = fd(eps, mu, T)
-        # first term, mn
-        chi_mn += A_k(eps, E_mk, Gamma) * G_R(eps + omega, E_nk, Gamma) * f
-        # first term, nm
-        chi_nm += A_k(eps, E_nk, Gamma) * G_R(eps + omega, E_mk, Gamma) * f
-
-        # second term
-        fw = fd(eps + omega, mu, T)
-        # second term, mn
-        chi_mn += A_k(eps + omega, E_nk, Gamma) * G_A(eps, E_mk, Gamma) * fw
-        # second term, nm
-        chi_nm += A_k(eps + omega, E_mk, Gamma) * G_A(eps, E_nk, Gamma) * fw
-
-    chi_mn = chi_mn * deps
-    chi_nm = chi_nm * deps
-    return - chi_mn, - chi_nm
-
-def chi_j_j2(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma, N=15, factor=5):
-    thetas = np.diag(thetas)
-
-    Nop = rhos_tilde.shape[0]
-    Nw = len(omegas)
-
-    ''' chi_j_j is bare current-current susceptibility (bubble) '''
-    chi_j_j = chi_UV(K, tok_tilde, tok_tilde, omegas, energije, Gamma, mu, T, N, factor)
-
-    ''' below we construct dchi_j_j, which is correction of the bubble,
-    for this we need rho-current and rho-rho susceptibilities in terms of bubbles '''
-    chi_rho_rho = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
-    chi_rho_j = np.zeros((Nop, Nw), dtype=np.complex128)
-    chi_j_rho = np.zeros((Nop, Nw), dtype=np.complex128)
-    for i in range(Nop):
-        chi_rho_j[i] = chi_UV(K, tok_tilde, rhos_tilde[i], omegas, energije, Gamma, mu, T, N, factor)
-        chi_j_rho[i] = chi_UV(K, rhos_tilde[i], tok_tilde, omegas, energije, Gamma, mu, T, N, factor)
-        for j in range(Nop):
-            chi_rho_rho[i,j] = chi_UV(K, rhos_tilde[i], rhos_tilde[j], omegas, energije, Gamma, mu, T, N, factor)
-
-    inverz = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
-    I = np.eye(Nop, dtype=np.complex128)
-    for i in range(Nw):
-        inverz[:,:,i] = LA.inv(I - chi_rho_rho[:,:,i] @ thetas)
-
-    dchi_j_j = np.einsum(
-        'aw,ab,bcw,cw->w',
-        chi_rho_j,
-        thetas,
-        inverz,
-        chi_j_rho
-    )
-    return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho
-
-
-
-
-
-#####
-
-
-import numpy as np
-from helpers_takarada import * 
-from module_takarada import *
-
-''' numerical parameters '''
-parameters1 = {'n_pass' : 1e-4,
-'epsilon_threshold' : 1e-8,
-'N_epsilon' : 5,
-'maxiter' : 1000,
-'eps_last' : 1e-8,
-'dmu' : 5.,
-'mix2' : 0.001,
-'mix3' : 1.5,
-'faktor1' : 0.1,
-'max_trials' : 15,
-'eps0' : 0.01,
-}
-
-parameters2 = {'n_pass' : 1e-4,
-'epsilon_threshold' : 1e-8,
-'N_epsilon' : 5,
-'maxiter' : 1000,
-'eps_last' : 1e-8,
-'dmu' : 5.,
-'mix2' : 0.001,
-'mix3' : 1.5,
-'faktor1' : 0.1,
-'max_trials' : 15,
-'eps0' : 0.01,
-}
-
-''' physical parameters '''
-a = 1.
-b = 0.5
-
-t12 = 0.
-delta = 0.
-
-t = 1.
-t_ = 0.5
-Vc = 0.5
-Vb = 2.
-
-gap = -2
-epsilon = 0.5*(gap + 2*t_ + 2*t)
-epsilon_ = epsilon
-
-phys_parameters = [b, t, t_, t12, epsilon, epsilon_, Vb, Vc, delta]
-
-mu0 = 0.
-include_hartree = False
-
-Nk = 1000
-''' create model, find ground state, heat system a bit '''
-m = model(Nk, mu0, phys_parameters, parameters1, parameters2, include_hartree)
-m.GS()
-
-beta0 = 50
-scale = 1.005
-betas = beta0/scale**np.arange(1,21)
-stops = [int(np.emath.logn(scale, beta0/beta)) for beta in betas]
-Ts = 1/betas
-Gamma = 0.005
-Nomega = 21
-eps = 0.1
-m.run2(betas, stops, Gamma, Nomega, eps)
-
-''' couple current to magnetic potential, measure expectation value of current '''
-t0 = 2.
-sigma = 0.02
-dt = 0.005
-Omega = 0.
-A0 = 0.01
-
-geom, phases = input_data(m.K, phys_parameters, m.mu)
-g_ffts = G_ffts(phases, m.Nk)
-tok = j_tok(m.K, phys_parameters, m.mu)
-rhos, thetas = rho_operators(m.K, phys_parameters, include_hartree)
-
-perturbation_operator = tok
-measure_operators = tok
-
-t_max = 250
-Ncorr = 10
-tol = 1e-8
-
-T = m.Ts[-1]
-fs = np.zeros(())
-
-do_freeze = True
-time_f, measurements_f = simulate_pulz(m.K, m.hk0, m.rho, phys_parameters, include_hartree, perturbation_operator, measure_operators,
-                                       A0, t0, sigma, Omega, dt, t_max, do_freeze, Ncorr, tol,
-                                       geom, phases, g_ffts)
-np.save('time_f.npy', time_f)
-np.save('measurements_f.npy', measurements_f[:,0].real)
-
-do_freeze = False
-time, measurements = simulate_pulz(m.K, m.hk0, m.rho, phys_parameters, include_hartree, perturbation_operator, measure_operators,
-                                   A0, t0, sigma, Omega, dt, t_max, do_freeze, Ncorr, tol,
-                                   geom, phases, g_ffts)
-np.save('time.npy', time)
-np.save('measurements.npy', measurements[:,0].real)
-
-
-calculate optical conductivity from it 
-etas = [0.001, 0.003, 0.006, 0.008, 0.01]
-omega_cut = 150*m.gap
-pulz = A_pulz(time_f, A0, t0, sigma, Omega)
-
-sigma_omegas1 = []
-sigma_omegas1f = []
-for i, eta in enumerate(etas):
-    print(i)
-    omega, sigma_omega1f = optical_conductivity(time_f, measurements_f[:,0], pulz, eta, omega_cut, m.Nk)
-    omega, sigma_omega1 = optical_conductivity(time, measurements[:,0], pulz, eta, omega_cut, m.Nk)
-    sigma_omegas1.append(sigma_omega1)
-    sigma_omegas1f.append(sigma_omega1f)
-np.save('omegas.npy', omega)
-np.save('sigma_omegas1.npy', np.array(sigma_omegas1))
-np.save('sigma_omegas1f.npy', np.array(sigma_omegas1f))
-
-tok_tilde = operator_tilde(m.tok, m.vecs)
-rhos_tilde = operator_tilde(rhos, m.vecs)
-
-
-Gammas = [0.001, 0.005, 0.01]
-T = m.Ts[-1]
-
-
-omega = np.linspace(0.01, 1.5, 101) * m.gap
-sigma_omegas2 = np.zeros((len(Gammas), len(omega)))
-sigma_omegas2f = np.copy(sigma_omegas2)
-sigma_omegas3 = np.copy(sigma_omegas2)
-sigma_omegas3f = np.copy(sigma_omegas2)
-
-
-for i, Gamma in enumerate(Gammas):
-    print(i)
-    chi_jj, dchi_j_j, chi_rh_rh, chi_rho_j = chi_j_j(m.K, tok_tilde, rhos_tilde, thetas, m.energije, m.mu, T, omega, Gamma)
-    #chi_jj2, dchi_j_j2, chi_rh_rh2, chi_rho_j2 = chi_j_j2(m.K, tok_tilde, rhos_tilde, thetas, m.energije, m.mu, T, omega, Gamma)
-    sigma_omega2f = chi_jj.imag / omega
-    sigma_omega2 = (chi_jj + dchi_j_j).imag / omega
-
-    sigma_omega3f = chi_jj2.imag / omega
-    sigma_omega3 = (chi_jj2 + dchi_j_j2).imag / omega
-
-    sigma_omegas2f[i] = sigma_omega2f
-    sigma_omegas2[i] = sigma_omega2
-    sigma_omegas3f[i] = sigma_omega3f
-    sigma_omegas3[i] = sigma_omega3
-
-np.save('sigma_omegas2.npy', np.array(sigma_omegas2))
-np.save('sigma_omegas2f.npy', np.array(sigma_omegas2f))
-
-np.save('sigma_omegas2.npy', np.array(sigma_omegas2))
-np.save('sigma_omegas2f.npy', np.array(sigma_omegas2f))
-
-
-
-fig, ax = plt.subplots(ncols=3, figsize=(13,4))
-c1, c2 = 'dodgerblue', 'tomato'
-ax[0].plot(time_f, measurements_f[:,0].real - measurements_f[0,0].real, label='HF frozen', color=c1, lw=3)
-ax[0].plot(time, measurements[:,0].real - measurements[0,0].real, label='HF dynamic', color=c2)
-
-leg = ax[0].legend(frameon=False)
-for text, line in zip(leg.get_texts(), leg.get_lines()):
-    text.set_color(line.get_color())
-
-maxima, maxim_vals = local_minima(measurements_f[:,0].real)
-minima, minim_vals = local_maxima(measurements_f[:,0].real)
-
-t_maxima = time_f[maxima][2:-2]
-t_minima = time_f[minima][1:-2]
-val_maxima = maxim_vals[2:-2]
-val_minima = minim_vals[1:-2]
-ax[0].scatter(t_maxima, val_maxima, color='black')
-ax[0].scatter(t_minima, val_minima, marker='x', color='blue')
-
-k_max, n_max = np.polyfit(np.log(t_maxima), np.log(np.abs(val_maxima)), 1)
-k_min, n_min = np.polyfit(np.log(t_minima), np.log(np.abs(val_minima)), 1)
-ax[1].plot(np.log(t_maxima), np.log(np.abs(val_maxima)), 'o', color='black', label=rf'maxima: slope$={np.round(k_max, 5)}$')
-ax[1].plot(np.log(t_minima), np.log(np.abs(val_minima)), 'x', color='blue', label=rf'minima: slope$={np.round(k_min, 5)}$')
-leg = ax[1].legend(frameon=False)
-
-for text, line in zip(leg.get_texts(), leg.get_lines()):
-    text.set_color(line.get_color())
-
-maxima, maxim_vals = local_minima(measurements[:,0].real)
-minima, minim_vals = local_maxima(measurements[:,0].real)
-
-t_maxima = time[maxima][2:-2]
-t_minima = time[minima][1:-2]
-val_maxima = maxim_vals[2:-2]
-val_minima = minim_vals[1:-2]
-ax[0].scatter(t_maxima, val_maxima, color='maroon')
-ax[0].scatter(t_minima, val_minima, marker='x', color='red')
-k_max, n_max = np.polyfit(np.log(t_maxima), np.log(np.abs(val_maxima)), 1)
-k_min, n_min = np.polyfit(np.log(t_minima), np.log(np.abs(val_minima)), 1)
-ax[2].plot(np.log(t_maxima), np.log(np.abs(val_maxima)), 'o', color='maroon', label=rf'maxima: slope$={np.round(k_max, 5)}$')
-ax[2].plot(np.log(t_minima), np.log(np.abs(val_minima)), 'x', color='red', label=rf'minima: slope$={np.round(k_min, 5)}$')
-leg = ax[2].legend(frameon=False)
-
-for text, line in zip(leg.get_texts(), leg.get_lines()):
-    text.set_color(line.get_color())
+    return np.trapezoid(sigma.real, omega)
+
+
+
+''' this is just helpers to get local maxima and local minima. I use this to get the envelope of the response '''
+def local_minima(arr):
+    n = len(arr)
+    indices, vals = [], []
+    for i in range(n):
+        if i > 0 and arr[i] > arr[i - 1]:
+            continue
+        if i < n - 1 and arr[i] >= arr[i + 1]:
+            continue
+        indices.append(i)
+        vals.append(arr[i])
+    return np.array(indices), np.array(vals)
+
+def local_maxima(arr):
+    n = len(arr)
+    indices, vals = [], []
+    for i in range(n):
+        if i > 0 and arr[i] <= arr[i - 1]:
+            continue
+        if i < n - 1 and arr[i] <= arr[i + 1]:
+            continue
+        indices.append(i)
+        vals.append(arr[i])
+    return np.array(indices), np.array(vals)
