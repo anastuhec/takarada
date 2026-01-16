@@ -1,7 +1,4 @@
 import numpy as np
-import scipy.linalg as LA
-from numba import njit, prange
-from scipy.optimize import brentq
 from helpers_takarada import *
 
 ''' create TNS class '''
@@ -101,7 +98,7 @@ class model:
                 self.next_T(T, 2, show_print)
 
     def run2(self, betas, stops, Gamma, Nomega, eps):
-        print('started')
+        print('started', flush=True)
         for i, beta in enumerate(betas):
             T = 1/beta
             if i not in stops:
@@ -115,7 +112,7 @@ class model:
                     n_save = self.n
                 self.next_T(T, 2)
             else:
-                print(f'started evaluating at beta={beta}')
+                print(f'started evaluating at beta={beta}', flush=True)
                 self.next_T(T, 1)
                 self.Ts.append(T)
                 self.betas.append(1/T)
