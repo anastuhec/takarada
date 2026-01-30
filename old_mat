@@ -1,0 +1,913 @@
+import numpy as np
+import scipy.linalg as LA
+from numpy.fft import fft, ifft
+import matplotlib
+from numba import njit, prange
+
+def colorFader(c1, c2, mix=0.5):
+    c1 = np.array(matplotlib.colors.to_rgb(c1))
+    c2 = np.array(matplotlib.colors.to_rgb(c2))
+    return matplotlib.colors.to_hex((1-mix)*c1 + mix*c2)
+
+def E_analytic(K, rho, phys_parameters):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    Nk = len(K)
+    delta_k = -Vb/Nk*np.sum(rho[1,0,:]) - Vc/Nk*np.sum(rho[1,0,:]*np.exp(-1j*K)) * np.exp(-1j*K)
+    E_minus = (t-t_)*np.cos(K) - np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
+    E_plus = (t-t_)*np.cos(K) + np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
+    return np.vstack([E_minus, E_plus])
+
+def v_analytic(K, rho, phys_parameters):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    Nk = len(K)
+
+    delta_b = -Vb/Nk*np.sum(rho[1,0,:])
+    delta_c = -Vc/Nk*np.sum(rho[1,0,:]*np.exp(-1j*K))
+    delta_k = delta_b + delta_c*np.exp(-1j*K)
+
+    vel_minus = -(t-t_)*np.sin(K) - (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
+    vel_plus = -(t-t_)*np.sin(K) + (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
+    return np.vstack([vel_minus, vel_plus])
+
+
+def rho0(Nk):
+    rho = np.zeros((2,2,Nk))
+    rho[0,0,:] = 1
+    return rho
+
+def h_k(k, rho, K, phys_parameters, eps0, include_hartree):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    
+    Nk = rho.shape[-1]
+    hk = np.zeros((2,2), dtype=np.complex128)
+    hk[0,0] += 2*t*np.cos(k) - epsilon
+    hk[1,1] += -2*t_*np.cos(k) + epsilon
+
+    ad = t12 * (np.exp(1j*k) + np.exp(-1j*k))
+    hk[0,1] += ad
+    hk[1,0] += ad.conj()
+
+    if include_hartree == True:
+        hk[0,0] += (Vb + Vc)*np.sum(rho[1,1,:])/Nk
+        hk[1,1] += (Vb + Vc)*np.sum(rho[0,0,:])/Nk
+
+    ad = - 1/Nk * Vb * np.sum(rho[1,0,:]) - 1/Nk * Vc * np.sum(rho[1,0,:] * np.exp(-1j*K)) * np.exp(-1j*k)
+    hk[0,1] += ad
+    hk[1,0] += ad.conj()
+
+    if eps0 != 0:
+        hk[0,1] += 2*eps0*1j*np.sin(k)
+        hk[1,0] += - 2*eps0*1j*np.sin(k)
+    return hk
+
+def diagonalize(rho, K, T, mu, phys_parameters, eps0, include_hartree):
+    Nk = len(K)
+    energije, vecs = np.zeros((2,Nk)), np.zeros((2,2,Nk), dtype=np.complex128)
+    fs = np.zeros((2,2,Nk))
+
+    for i in [0, Nk//2]:
+        en, v = LA.eigh(h_k(K[i], rho, K, phys_parameters, eps0, include_hartree))
+        energije[:,i] = en
+        vecs[:,:,i] = v
+        if T == 0:
+            np.fill_diagonal(fs[:, :, i], np.array([1, 0]))
+        else:
+            np.fill_diagonal(fs[:,:,i], 1/(1 + np.exp((en - mu)/T)))
+
+    for i in range(1, Nk//2):
+        en, v = LA.eigh(h_k(K[i], rho, K, phys_parameters, eps0, include_hartree))
+        energije[:,i] = en
+        energije[:,-i] = en
+        vecs[:,:,i] = v
+        vecs[:,:,-i] = v.conj()
+        if T == 0:
+            np.fill_diagonal(fs[:, :, i], np.array([1, 0]))
+            np.fill_diagonal(fs[:, :, -i], np.array([1, 0]))
+        else:
+            np.fill_diagonal(fs[:,:,i], 1/(1 + np.exp((en - mu)/T)))
+            np.fill_diagonal(fs[:,:,-i], 1/(1 + np.exp((en - mu)/T)))
+    return energije, vecs, fs
+
+def F(rho, K, T, mu, phys_parameters, eps0, include_hartree):
+    _, vecs, fs = diagonalize(rho, K, T, mu, phys_parameters, eps0, include_hartree)
+    rho_new = np.einsum('ijk,jmk,mnk->ink', vecs, fs, np.swapaxes(vecs.conj(),0,1))
+    return rho_new, np.max(np.abs(rho - rho_new))
+
+def zasedenost(rho):
+    return (np.sum(np.diag(np.einsum('ijk->ij', rho)))/(np.prod(rho.shape[-1]))).real
+
+def Rho_next(rho, K, T, mu, phys_parameters, eps0,
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5):
+    err, N_iters = 1, 0
+    while err > epsilon_threshold and N_iters < maxiter:
+        if N_iters < N_epsilon: eps = eps0
+        else: eps = 0
+        rho_new, err = F(rho, K, T, mu, phys_parameters, eps, include_hartree)
+        rho = rho_new * mix + rho * (1 - mix)
+        N_iters += 1
+    rho, _ = F(rho, K, T, mu, phys_parameters, 0, include_hartree)
+    energije, vecs, fs = diagonalize(rho, K, T, mu, phys_parameters, 0, include_hartree)
+    return rho, err, energije, vecs, fs, zasedenost(rho)
+
+def Phi(K, rho):
+    Nk = rho.shape[-1]
+    return [1/Nk * np.sum(rho[0,1,:] * np.exp(-1j*K*delta)).real for delta in [0,1]]
+
+def NewMu(K, rho, T, mu, dmu, phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, n_pass=1e-4, mix2=0.001, mix3=1.5, max_trials=30):
+    rho_a, err_a, energije_a, vecs_a, fs_a, n_a = Rho_next(rho, K, T, mu, phys_parameters, eps0,
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)
+    if np.abs(n_a - 1) < n_pass and err_a < epsilon_threshold:
+        return rho_a, err_a, energije_a, vecs_a, fs_a, n_a, mu
+    n_b = Rho_next(rho, K, T, mu + dmu, phys_parameters, eps0,
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)[-1]
+    chi = (n_b - n_a)/dmu
+    if chi != 0: mu = mu - mix2 * (n_a - 1)/np.abs(chi)
+
+    pogoj = False
+    koraki = 0
+    if np.abs(chi) > 0: faktor = (n_a - 1)/chi * mix3
+    else: faktor = 0.1
+    if chi >= 0:
+        if n_a >= 1:
+            sign = -1
+        elif n_a < 1: sign = +1
+    elif chi < 0:
+        if n_a > 1: sign = +1
+        elif n_a < 1: sign = -1
+        
+    sgns = np.ones(2) * np.sign(n_a - 1)
+    ns = np.array([0, n_a])
+    mus = [0, mu]
+    enough = False
+    while sgns[0] == sgns[1]:
+        if np.abs(n_a - 1) < n_pass and err_a < epsilon_threshold:
+            enough = True
+            break
+        rho_b, err_b, energije_b, vecs_b, fs_b, n_b = Rho_next(rho, K, T, mu + faktor*koraki*sign, phys_parameters, eps0,
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)
+        if np.abs(n_b - 1) < n_pass and err_b < epsilon_threshold:
+            return rho_b, err_b, energije_b, vecs_b, fs_b, n_b, mu + faktor*koraki*sign
+        ns[0] = n_b
+        mus[0] = mu + faktor*koraki*sign
+        sgns[1] = np.sign(n_b - 1)
+        if sgns[0] != sgns[1]: break
+        if n_b < 1 and n_b < ns[1]: sign *= -1
+        if n_b > 1 and n_b > ns[1]: sign *= -1
+        ns = np.roll(ns, 1)
+        mus = np.roll(mus, 1)
+        sgns[1] = np.sign(n_b - 1)
+        koraki += 1
+        if np.abs(n_b - 1) < n_pass and err_b < epsilon_threshold:
+            enough = True
+            mu_mid = mu + faktor*koraki*sign
+            break
+        
+    mus = np.sort(np.array([mu + faktor*koraki*sign, mu + faktor*(koraki-1)*sign]))
+    ns = np.sort(np.array(ns))
+
+    trials = 0
+    while pogoj == False:
+        if enough == True:
+            break   
+        mu_mid = (mus[0] + mus[1])/2
+        n_mid = Rho_next(rho, K, T, mu_mid, phys_parameters, eps0,
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)[-1]
+        if n_mid > 1: mus[1] = mu_mid
+        elif n_mid < 1: mus[0] = mu_mid
+        if np.abs(n_mid - 1) < n_pass: break
+        trials += 1 
+        if trials > max_trials: break
+    rho, err, energije, vecs, fs, n = Rho_next(rho, K, T, mu_mid, phys_parameters, eps0,
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)
+    return rho, err, energije, vecs, fs, n, mu_mid
+
+''' df/domega, f je Fermi-Diracova porazdelitvena funkcija '''
+@njit(cache=True)
+def fd_1(omega, T): return -1/(4*T)/np.cosh(omega/(2*T))**2
+
+@njit(cache=True)
+def parameters(b, t, t_, t12, epsilon, Vb, Vc, mu):
+    kinetic = np.array([
+        (1, 1, 1, t),
+        (-1, 1, 1, t),
+        (1, 2, 2, -t_),
+        (-1, 2, 2, -t_),
+        (0, 1, 2, t12),
+        (1, 1, 2, t12),
+        (0, 2, 1, t12),
+        (-1, 2, 1, t12),
+        (0, 1, 1, -epsilon - mu),
+        (0, 2, 2, epsilon - mu)
+    ])
+
+    interaction = np.array([
+        (0, 1, 2, Vb / 2),
+        (0, 2, 1, Vb / 2),
+        (1, 1, 2, Vc / 2),
+        (-1, 2, 1, Vc / 2)
+    ])
+
+    pos = np.array([0.0, b])
+    return pos, kinetic, interaction
+
+''' matrix for number density operator '''
+@njit(cache=True)
+def j_tok(K, phys_parameters, mu):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, _ = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    j = np.zeros((2, 2, Nk), dtype=np.complex128)
+    for line in kinetic:
+        x, orb1, orb2, t = line
+        x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+        ad = - 1j * t * np.exp(-1j * K * x) * (pos[orb1 - 1] - pos[orb2 - 1] + x)
+        j[orb1 - 1, orb2 - 1] += ad
+    return j
+
+''' kinetic energy current matrix '''
+@njit(cache=True)
+def j_1(K, phys_parameters, mu):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, _ = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    j = np.zeros((2, 2, Nk), dtype=np.complex128)
+    for line in kinetic:
+        x, orb1, orb2, t = line
+        x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+        for line_ in kinetic:
+            x_, orb1_, orb2_, t_ = line_
+            x_, orb1_, orb2_, t_ = float(x_), int(orb1_), int(orb2_), float(t_)
+            if orb2 == orb1_:
+                j[orb1 - 1, orb2_ - 1] += - 1j * t * t_ * 0.5 * np.exp(-1j * (K * (x + x_))) * (pos[orb1 - 1] - pos[orb2 - 1] + x + x_)
+    return j
+
+@njit(cache=True)
+def create_jI(pos, kinetic, interaction, Nk, k, q):
+    j_I = np.zeros((2,2,2), dtype=np.complex128)
+    for line in kinetic:
+        x, orb1, orb2, t = line
+        x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+        if orb1 == orb2 and x == 0: pass
+        else:
+            for line_ in interaction:
+                x_, orb1_, orb2_, V_ = line_
+                x_, orb1_, orb2_, V_  = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                if orb2 == orb2_:
+                    ad = -1j * t * V_ * np.exp(-1j * (k*x - q*x_)) * np.exp(-1j*q*x) * (pos[orb2 - 1] - pos[orb1_ - 1] - x_) / Nk
+                    j_I[orb1 - 1, orb1_ - 1, orb2 - 1] += ad
+
+                if orb1 == orb2_:
+                    ad = 1j * t * V_ * np.exp(-1j * (k*x - q*x_)) * (pos[orb1 - 1] - pos[orb1_ - 1] - x_) / Nk
+                    j_I[orb1 - 1, orb1_ -1, orb2 -1] += ad
+    return j_I
+
+@njit(cache=True)
+def spektralna_k(omega, mu, energije_k, Gamma=0.05):
+    A = np.zeros((2,2), dtype=np.complex128)
+    for i in range(2):
+        A[i,i] = -1/np.pi * Gamma / ((omega - energije_k[i] + mu)**2 + Gamma**2)
+    return A
+
+def mf_matrix1(K, rho, phys_parameters, mu):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            suma_n = np.sum(rho[orb1_ - 1, orb1_ - 1, :])
+                            lega = pos[orb2 - 1] - pos[orb1_ - 1] - x_
+                            matrix[orb1 -1, orb2 - 1] += -1j * t * V_ * lega * np.exp(-1j*K*x) / Nk * suma_n
+
+                        if orb1 == orb2_:
+                            suma_n = np.sum(rho[orb1_ - 1, orb1_ - 1, :])
+                            lega = pos[orb1 - 1] - pos[orb1_ - 1] - x_
+                            matrix[orb1 - 1, orb2 - 1] += 1j * t * V_ * lega * np.exp(-1j*K*x) / Nk * suma_n
+    return matrix
+
+def mf_matrix2(K, rho, phys_parameters, mu):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            suma_n = np.sum(rho[orb1 - 1, orb2 - 1, :] * np.exp(-1j*K*x))
+                            lega = pos[orb2 - 1] - pos[orb1_ - 1] - x_
+                            matrix[orb1_ -1, orb1_ - 1] += -1j * t * V_ * lega / Nk * suma_n
+
+                        if orb1 == orb2_:
+                            suma_n = np.sum(rho[orb1 - 1, orb2 - 1, :] * np.exp(-1j*K*x))
+                            lega = pos[orb1 - 1] - pos[orb1_ - 1] - x_
+                            matrix[orb1_ - 1, orb1_ - 1] += 1j * t * V_ * lega  / Nk * suma_n
+    return matrix
+
+
+def mf_matrix3(K, rho, phys_parameters, mu):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    f_k = t * np.exp(-1j*K*x) / Nk
+
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            lega = pos[orb2 - 1] - pos[orb1_ - 1] - x_
+                            g = -1j * V_ * lega * np.exp(1j*K*x) * np.exp(-1j*K*x_)
+                            h = rho[orb1 - 1, orb1_ - 1, :]
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+
+                            matrix[orb1_ -1, orb2 -1] +=  f_k * gh
+
+                        if orb1 == orb2_:
+                            lega = pos[orb1 - 1] - pos[orb1_ - 1] - x_
+                            g = 1j * V_ * lega * np.exp(-1j*K*x_)
+                            h = rho[orb1 - 1, orb1_ - 1, :]
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+                            matrix[orb1_ -1, orb2 - 1] += f_k * gh
+    return -matrix
+
+def mf_matrix4(K, rho, phys_parameters, mu):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            lega = pos[orb2 - 1] - pos[orb1_ - 1] - x_
+                            g = -1j * V_ * lega * np.exp(-1j*K*x) * np.exp(1j*K*x_)
+                            h = t * np.exp(-1j*K*x) * rho[orb1_ - 1, orb2 - 1, :] / Nk
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+
+                            matrix[orb1 -1, orb1_ -1] +=  gh
+
+                        if orb1 == orb2_:
+                            lega = pos[orb1 - 1] - pos[orb1_ - 1] - x_
+                            g = 1j * V_ * lega * np.exp(1j*K*x_)
+                            h = t * np.exp(-1j*K*x) * rho[orb1_ - 1, orb2 - 1, :] / Nk
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+                            matrix[orb1 -1, orb1_ - 1] += gh
+    return -matrix
+
+def phi_Q(K, rho, phys_parameters, vecs, energije, tok, mu, omegas, Gamma):
+    Nk = len(K)
+    mQ = mf_matrix1(K, rho, phys_parameters, mu) + mf_matrix2(K, rho, phys_parameters, mu) + mf_matrix3(K, rho, phys_parameters, mu) + mf_matrix4(K, rho, phys_parameters, mu)
+    phiQ = np.zeros(len(omegas), dtype=np.complex128)
+    for i in prange(len(omegas)):
+        omega = omegas[i]
+        for j in range(Nk):
+            vec = vecs[:,:,j]
+            tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            M_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(mQ[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            A = spektralna_k(omega, mu, energije[:,j], Gamma)
+            phiQ[i] += np.trace(M_k @ A @ tok_k @ A)
+    return phiQ / Nk
+
+@njit(parallel=True, cache=True)
+def phi_ii3(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    suma = 0.0 + 0.0j
+    count = 0
+
+    for i in [0, Nk//2]:
+
+        k = K[i]
+        j_I = create_jI(pos, kinetic, interaction, Nk, k, 0)
+        vec = vecs[:,:,i]
+
+        tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,i]) @ np.ascontiguousarray(vec).conj().T
+
+        tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+        for u in prange(Nk):
+            for ii in range(j_I.shape[0]):
+                for jj in range(j_I.shape[1]):
+                    g = np.array([rho[0,0,u], rho[1,1,u]])
+                    tmp[ii, jj] += np.dot(j_I[ii, :, jj], g)
+
+        M_3 = vec @ tmp @ vec.conj().T
+
+        A = spektralna_k(omega, mu, energije[:,i], Gamma)
+
+        mat = M_3 @ A @ tok_k @ A
+        for j in range(2):
+            suma += mat[j,j].real
+
+    # half of Brillouin zone; can exploit symmetry
+    for i in prange(1,Nk//2):
+
+        k = K[i]
+        j_I = create_jI(pos, kinetic, interaction, Nk, k, 0)
+        vec = vecs[:,:,i]
+
+        tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,i]) @ np.ascontiguousarray(vec).conj().T
+
+        tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+        for u in range(Nk):
+            for ii in range(j_I.shape[0]):
+                for jj in range(j_I.shape[1]):
+                    g = np.array([rho[0,0,u], rho[1,1,u]])
+                    tmp[ii, jj] += np.dot(j_I[ii, :, jj], g)
+
+        M_3 = vec @ tmp @ vec.conj().T
+
+        A = spektralna_k(omega, mu, energije[:,i], Gamma)
+
+        mat = M_3 @ A @ tok_k @ A
+        for j in range(2):
+            suma += 2 * mat[j,j].real
+    return suma  / Nk, count
+
+
+@njit(parallel=True)
+def phi_ii4(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    suma  = 0.0 + 0.0j
+    count = 0
+
+    for i in prange(1, Nk//2):
+        k = K[i]
+        local_sum = 0.0 + 0.0j
+        for j in range(1, Nk//2):
+            q = K[j]
+
+            j_I = create_jI(pos, kinetic, interaction, Nk, k, q)
+
+            vec = vecs[:,:,ind]
+            tok_kq = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,ind]) @ np.ascontiguousarray(vec).conj().T
+            tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+            for ii in range(j_I.shape[0]):
+                for jj in range(j_I.shape[1]):
+                    tmp[ii, jj] = np.dot(j_I[ii, jj, :], rho[jj, :, i])
+
+            M_4 = -vec @ tmp @ vec.conj().T
+            A = spektralna_k(omega, mu, energije[:,ind], Gamma)
+            local_sum += 2 * np.trace(M_4 @ A @ tok_kq @ A).real
+        suma += local_sum
+
+    for i in prange(Nk//2, Nk):
+        k = K[i]
+        for j in range(1,Nk//2):
+            q = K[j]
+            ind = (i + j - Nk//2) % Nk
+
+            j_I = create_jI(pos, kinetic, interaction, Nk, k, q)
+
+            vec = vecs[:,:,ind]
+            tok_kq = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,ind]) @ np.ascontiguousarray(vec).conj().T
+
+            tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+            for ii in range(j_I.shape[0]):
+                for jj in range(j_I.shape[1]):
+                    tmp[ii, jj] = np.dot(j_I[ii, jj, :], rho[jj, :, i])
+
+            M_4 = -vec @ tmp @ vec.conj().T
+            A = spektralna_k(omega, mu, energije[:,ind], Gamma)
+            suma += 2 * np.trace(M_4 @ A @ tok_kq @ A).real
+
+    for j, q in enumerate(K[1:Nk//2]):
+
+        # i = 0
+        i=0
+        k = K[i]
+        ind = (i + j - Nk//2) % Nk
+
+        j_I = create_jI(pos, kinetic, interaction, Nk, k, q)
+
+        vec = vecs[:,:,ind]
+
+        tok_kq = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,ind]) @ np.ascontiguousarray(vec).conj().T
+        tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+        for ii in range(j_I.shape[0]):
+            for jj in range(j_I.shape[1]):
+                tmp[ii, jj] = np.dot(j_I[ii, jj, :], rho[jj, :, i])
+
+        M_4 = - vec @ tmp @ vec.conj().T
+        A = spektralna_k(omega, mu, energije[:,ind], Gamma)
+        suma += 2 * np.trace(M_4 @ A @ tok_kq @ A).real
+
+    for j, q in enumerate(K[1:Nk//2]):
+        # i = Nk/2
+        i=Nk//2
+        k=K[i]
+        ind = (i + j - Nk//2) % Nk
+
+        j_I = create_jI(pos, kinetic, interaction, Nk, k, q)
+        ind = (i + j - Nk//2) % Nk
+        vec = vecs[:,:,ind]
+        tok_kq = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,ind]) @ np.ascontiguousarray(vec).conj().T
+        tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+        for ii in range(j_I.shape[0]):
+            for jj in range(j_I.shape[1]):
+                tmp[ii, jj] = np.dot(j_I[ii, jj, :], rho[jj, :, i])
+
+        M_4 = - vec @ tmp @ vec.conj().T
+        A = spektralna_k(omega, mu, energije[:,ind], Gamma)
+        suma += 2 * np.trace(M_4 @ A @ tok_kq @ A).real
+
+    # q = -pi (j=0) and q = 0 (j=N/2)
+    for i, k in enumerate(K[1:Nk//2]):
+        # j = 0
+        j=0
+        q = K[j]
+        ind = (i + j - Nk//2) % Nk
+
+        j_I = create_jI(pos, kinetic, interaction, Nk, k, q)
+        vec = vecs[:,:,ind]
+        tok_kq = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,ind]) @ np.ascontiguousarray(vec).conj().T
+
+        tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+        for ii in range(j_I.shape[0]):
+            for jj in range(j_I.shape[1]):
+                tmp[ii, jj] = np.dot(j_I[ii, jj, :], rho[jj, :, i])
+
+        M_4 = -vec @ tmp @ vec.conj().T
+        A = spektralna_k(omega, mu, energije[:,ind], Gamma)
+        suma += 2 * np.trace(M_4 @ A @ tok_kq @ A).real
+
+    for i, k in enumerate(K[1:Nk//2]):
+        # j = Nk/2
+        j=Nk//2
+        q=K[j]
+        ind = (i + j - Nk//2) % Nk
+
+        j_I = create_jI(pos, kinetic, interaction, Nk, k, q)
+        vec = vecs[:,:,ind]
+        tok_kq = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,ind]) @ np.ascontiguousarray(vec).conj().T
+        # note the MINUS
+        tmp = np.zeros((j_I.shape[0], j_I.shape[1]), dtype=np.complex128)
+        for ii in range(j_I.shape[0]):
+            for jj in range(j_I.shape[1]):
+                tmp[ii, jj] = np.dot(j_I[ii, jj, :], rho[jj, :, i])
+        M_4 = -vec @ tmp @ vec.conj().T
+        A = spektralna_k(omega, mu, energije[:,ind], Gamma)
+        suma += 2 * np.trace(M_4 @ A @ tok_kq @ A).real
+    return suma / Nk, count
+
+@njit(parallel=True)
+def phi_ii5(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    suma = 0.0 + 0.0j
+    count = 0
+    M_5 = np.zeros(2, dtype=np.complex128)
+    for i in prange(1,Nk//2):
+        j_I = create_jI(pos, kinetic, interaction, Nk, K[i], 0)
+
+        for orb in range(2):
+            for alpha in range(2):
+                for beta in range(2):
+                    M_5[orb] += 2 * (j_I[alpha,orb,beta] * rho[alpha,beta,i]).real
+
+    for i in [0,Nk//2]:
+        j_I = create_jI(pos, kinetic, interaction, Nk, K[i], 0)
+
+        for orb in range(2):
+            for alpha in range(2):
+                for beta in range(2):
+                    M_5[orb] += j_I[alpha,orb,beta] * rho[alpha,beta,i]
+
+    M_5new = np.array([[M_5[0], 0.], [0., M_5[1]]])
+    for i in [0, Nk//2]:
+
+        vec = vecs[:,:,i]
+        tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,i]) @ np.ascontiguousarray(vec).conj().T
+        M_5i = vec @ M_5new @ vec.conj().T
+        A = spektralna_k(omega, mu, energije[:,i], Gamma)
+        suma += np.trace(M_5i @ A @ tok_k @ A)
+    for i in range(1,Nk//2):
+
+        vec = vecs[:,:,i]
+        tok_k = vec @ tok[:,:,i] @ vec.conj().T
+        M_5i = vec @ M_5new @ vec.conj().T
+        A = spektralna_k(omega, mu, energije[:,i], Gamma)
+        suma += 2 * np.trace(M_5i @ A @ tok_k @ A).real
+    return suma / Nk, count
+
+@njit(parallel=True, cache=True)
+def phi_ii6(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma):
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, Vb, Vc, mu)
+    Nk = len(K)
+    suma = 0.0 + 0.0j
+    count = 0
+
+    for i in prange(Nk):
+        if np.max(np.array([-fd_1(omega - energije[orb,i] + mu, T) for orb in range(2)])) < eps:
+            count += 1
+            pass
+        else:
+            M_6 = np.zeros((2, 2), dtype=np.complex128)
+            for j in range(Nk):
+                ind = (i + j - Nk//2) % Nk
+                j_I = create_jI(pos, kinetic, interaction, Nk, K[i], K[j])
+
+                for ii in range(j_I.shape[0]):
+                    for jj in range(j_I.shape[1]):
+                        M_6[ii, jj] += np.dot(j_I[:, ii, jj], rho[:, ii, ind])
+            vec = vecs[:,:,i]
+            tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,i]) @ np.ascontiguousarray(vec).conj().T
+            M_6i = - vec @ M_6 @ vec.conj().T
+            A = spektralna_k(omega, mu, energije[:,i], Gamma)
+            suma += np.trace(M_6i @ A @ tok_k @ A)
+    return suma / Nk, count
+
+@njit(parallel=True, cache=True)
+def phi_Kubo(K, vecs, energije, tok, mu, omegas, Gamma):
+    Nk = len(K)
+
+    phi = np.zeros(len(omegas), dtype=np.complex128)
+    for i in prange(len(omegas)):
+        omega = omegas[i]
+        for j in [0,Nk//2]:
+            vec = vecs[:,:,j]
+            tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            A = spektralna_k(omega, mu, energije[:,j], Gamma)
+            phi[i] += np.trace(tok_k @ A @ tok_k @ A)
+
+        for j in range(1,Nk//2):
+            vec = vecs[:,:,j]
+            tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            A = spektralna_k(omega, mu, energije[:,j], Gamma)
+            phi[i] += 2 * np.trace(tok_k @ A @ tok_k @ A).real
+    return phi / Nk
+
+@njit(parallel=True, cache=True)
+def phi_K(K, vecs, energije, tok, tokK, mu, omegas, Gamma):
+    Nk = len(K)
+
+    phi = np.zeros(len(omegas), dtype=np.complex128)
+    for i in prange(len(omegas)):
+        omega = omegas[i]
+        for j in [0,Nk//2]:
+            vec = vecs[:,:,j]
+            tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            tok_Kk = np.ascontiguousarray(vec) @ np.ascontiguousarray(tokK[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            A = spektralna_k(omega, mu, energije[:,j], Gamma)
+            phi[i] += np.trace(tok_Kk @ A @ tok_k @ A)
+
+        for j in range(1,Nk//2):
+            vec = vecs[:,:,j]
+            tok_k = np.ascontiguousarray(vec) @ np.ascontiguousarray(tok[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            tok_Kk = np.ascontiguousarray(vec) @ np.ascontiguousarray(tokK[:,:,j]) @ np.ascontiguousarray(vec).conj().T
+            A = spektralna_k(omega, mu, energije[:,j], Gamma)
+            phi[i] += 2 * np.trace(tok_Kk @ A @ tok_k @ A).real
+    return phi / Nk
+
+def delta_approximation(x, width, shape='Gaussian'):
+    if shape == 'Gaussian':
+        return 1/(2*np.pi*width**2)**0.5 * np.exp(-x**2/(2*width**2))
+    elif shape == 'Lorentzian':
+        return 1/np.pi * width/(x**2 + width**2)
+
+def phi_Boltzmann(K, rho, phys_parameters, energije, mu, omegas, faktor=0.2, shape='Gaussian'):
+    Nk = len(K)
+    phi = np.zeros(len(omegas))
+    if phys_parameters[3] == 0:
+        vel = v_analytic(K, rho, phys_parameters)
+    else:
+        vel1 = np.diff(energije[0]) / (K[1] - K[0])
+        vel2 = np.diff(energije[1]) / (K[1] - K[0])
+        vel = np.zeros((2, Nk))
+        vel[0] = np.hstack([[0], vel1])
+        vel[1] = np.hstack([[0], vel2])
+
+    v_max = np.max(np.abs(vel))
+    sigma = np.sqrt(v_max * (omegas[1] - omegas[0]) * (K[1] - K[0])) * faktor
+
+    for i, omega in enumerate(omegas):
+        for j in range(0,Nk//2+1):
+            if j in [0,Nk//2]: multiply = 1
+            else: multiply = 2
+            for alpha in [0,1]:
+                phi[i] += multiply * delta_approximation(omega - energije[alpha,j] + mu, sigma, shape) * vel[alpha,j]**2
+    return phi / Nk
+
+@njit(parallel=True, cache=True)
+def phi_Q2(K, rho, vecs, energije, phys_parameters, tok, mu, omegas, Gamma):
+    n_omega = len(omegas)
+    phi_q = np.zeros((4, n_omega), dtype=np.complex128)
+    for i in prange(n_omega):
+        omega = omegas[i]
+        phi_q[0,i] = phi_ii3(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma)
+        phi_q[1,i] = phi_ii4(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma)
+        phi_q[2,i] = phi_ii5(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma)
+        phi_q[3,i] = phi_ii6(K, rho, vecs, energije, phys_parameters, tok, mu, omega, Gamma)
+    return phi_q
+
+''' create TNS class '''
+class model:
+    def __init__(self, Nk, mu0, phys_parameters, parameters1, parameters2, include_hartree):
+        self.K = 2*np.pi * np.arange(-Nk/2, Nk/2) / Nk
+        self.Nk = Nk
+        self.parameters1 = parameters1
+        self.parameters2 = parameters2
+        self.phys_parameters = phys_parameters
+        b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+
+        self.mu = mu0
+        self.include_hartree = include_hartree
+
+        self.phis = []
+        self.mus = []
+        self.errors = []
+        self.occupations = []
+        self.times_rho = []
+        self.times_boltzmann = []
+        self.times_kubo = []
+        self.Ts = []
+        self.betas = []
+
+        self.kubo_L11 = []
+        self.kubo_LI = []
+        self.kubo_LK = []
+        self.boltz_L11 = []
+
+    def GS(self):
+        rho, err, energije, vecs, fs, n = Rho_next(rho0(self.Nk), self.K, 0, self.mu, self.phys_parameters, self.parameters1['eps0'],
+                                                  self.parameters1['epsilon_threshold'], self.parameters1['N_epsilon'], self.parameters1['maxiter'], self.include_hartree, mix=0.5)
+        self.rho = rho
+        self.energije = energije
+        self.vecs = vecs
+        self.fs = fs
+        self.phi = Phi(self.K, self.rho)
+
+        #print(f'found ground state, err={err}, n_err={np.abs(n-1)}, phi={self.phi}')
+
+    def next_T(self, T, i, show_print=None) -> None:
+        if i == 1: parameters = self.parameters1
+        elif i == 2: parameters = self.parameters2
+
+        eps0 = parameters['eps0']
+        dmu = parameters['dmu']
+        epsilon_threshold = parameters['epsilon_threshold']
+        N_epsilon = parameters['N_epsilon']
+        maxiter = parameters['maxiter']
+        n_pass = parameters['n_pass']
+
+        rho, err, energije, vecs, fs, n, mu = NewMu(self.K, self.rho, T, self.mu, dmu,
+                                                        self.phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, self.include_hartree, n_pass=n_pass)
+        self.rho = rho
+        self.energije = energije
+        self.fs = fs
+        self.vecs = vecs
+        self.err = err
+        self.n = n
+        self.mu = mu
+        self.phi = Phi(self.K, self.rho)
+        if show_print == None: print(1/T, err, n, self.phi)
+
+    def run(self, Ts, Gamma=0.05, show_print=None):
+        for _, T in enumerate(Ts):
+            if T == Ts[-1]:
+                self.next_T(T, 1, show_print)
+                self.Ts.append(T)
+                self.betas.append(1/T)
+                self.phis.append(self.phi)
+                self.mus.append(self.mu)
+                self.errors.append(self.err)
+                self.occupations.append(self.n)
+
+                fs = np.zeros((2,2,self.Nk))
+                for i in range(self.Nk):
+                    np.fill_diagonal(fs[:, :, i], 1/(1 + np.exp((self.energije[:,i] - self.mu)/T)))
+            else:
+                self.next_T(T, 2, show_print)
+
+    def reset(self, mu0):
+        self.GS()
+        self.mu = mu0
+
+    def temperature_propagate(self, mu0, beta0, betas, scale=1.05):
+        ends = [int(np.emath.logn(scale, beta0/beta)) for beta in betas]
+        Ts = 1/np.array(betas)
+        for i, _ in enumerate(Ts):
+            self.reset(mu0)
+            set_betas = beta0/scale**np.arange(ends[i])
+            set_Ts = 1/set_betas
+            self.run(set_Ts)
+
+def find_GS_mu(Nk, mu0, phys_parameters, parameters1, parameters2, include_hartree, beta0=40, beta1=30, scale=1.05):
+    m = model(Nk, mu0, phys_parameters, parameters1, parameters2, include_hartree)
+    m.GS()
+    betas = [beta1]
+    ends = [int(np.emath.logn(scale, beta0/beta)) for beta in betas]
+    Ts = 1/np.array(betas)
+    for i, T in enumerate(Ts):
+        m.reset(mu0)
+        set_betas = beta0/scale**np.arange(ends[i])
+        set_Ts = 1/set_betas
+        m.run(set_Ts, show_print=False)
+    mu0=0.5*(np.min(m.energije[1]) + np.max(m.energije[0]))
+    m = model(Nk, mu0, phys_parameters, parameters1, parameters2, include_hartree)
+    ends = [int(np.emath.logn(scale, beta0/beta)) for beta in betas]
+    Ts = 1/np.array(betas)
+    m.GS()
+    for i, T in enumerate(Ts):
+        m.reset(mu0)
+        set_betas = beta0/scale**np.arange(ends[i])
+        set_Ts = 1/set_betas
+        m.run(set_Ts, show_print=False)
+    print('found mu in the Ground state')
+    return float(m.mu)
+
+def phi_mf(K, rho, U, energije, phys_parameters, mu, omegas, Gamma):
+    Nk = len(K)
+    Nk = len(K)
+    b, t, t_, t12, epsilon, Vb, Vc = phys_parameters
+
+    delta_b = -Vb/Nk*np.sum(rho[1,0,:])
+    delta_c = -Vc/Nk*np.sum(rho[1,0,:]*np.exp(-1j*K))
+    delta_k = delta_b + delta_c*np.exp(-1j*K)
+
+    j, _, _ = j_tok(K, phys_parameters, mu)
+    j_mf = np.zeros((2,2,Nk), dtype=np.complex128)
+    ad = -(t-t_) * (delta_k * np.sin(K) + 1j/4*(Vc/Vb*delta_b * np.exp(-1j*K) - Vb/Vc*delta_c) - 1j/2*(delta_b - delta_c*np.exp(-1j*K))*np.cos(K) )
+    j_mf[0,1,:] = ad
+    j_mf[1,0,:] = ad.conj()
+
+    phimf = np.zeros((len(omegas), Nk), dtype=np.complex128)
+    for i, omega in enumerate(omegas):
+        for ii, _ in enumerate(K):
+            u = U[:,:,ii]
+            A = spektralna_k(omega, mu, energije[:,ii], Gamma=Gamma)
+            phimf[i, ii] += np.trace(u @ j_mf[:,:,ii] @ u.conj().T @ A @ u @ j[:,:,ii] @ u.conj().T @ A) 
+    phimf = np.einsum('uk->u', phimf) / Nk
+    return phimf
+
+def Kn_boltz(K, energije, mu, T):
+    K0, K1 = 0, 0
+    vel1 = np.diff(energije[0]) / (K[1] - K[0])
+    vel2 = np.diff(energije[1]) / (K[1] - K[0])
+    for ind in range(len(vel1)):
+        K0 += -fd_1(energije[0,ind] - mu, T) * vel1[ind]**2 - \
+            fd_1(energije[1,ind] - mu, T) * vel2[ind]**2
+        K1 += -fd_1(energije[0,ind] - mu, T) * vel1[ind]**2 * (energije[0,ind] - mu) - \
+            fd_1(energije[1,ind] - mu, T) * vel2[ind]**2 * (energije[1,ind] - mu)
+    return K0, K1
