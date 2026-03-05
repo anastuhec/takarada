@@ -6,7 +6,7 @@ from scipy.optimize import brentq
 # ====== self-consistency calculation ======
 
 @njit(cache=True)
-def parameters(b, t, t_, t12, epsilon, epsilon_, Vb, Vc, mu, delta=0):
+def parameters(b, t, t_, t12, Vb, Vc, delta=0):
     kinetic = np.array([
         (1, 0, 0, t),
         (-1, 0, 0, t),
@@ -16,8 +16,9 @@ def parameters(b, t, t_, t12, epsilon, epsilon_, Vb, Vc, mu, delta=0):
         (-1, 0, 1, t12 - delta),
         (0, 1, 0, t12 + delta),
         (1, 1, 0, t12 - delta),
-        (0, 0, 0, epsilon - mu),
-        (0, 1, 1, epsilon_ - mu)
+        # onsite energies don't matter for current operators
+        #(0, 0, 0, epsilon - mu),
+        #(0, 1, 1, epsilon_ - mu) 
     ])
 
     interaction = np.array([
@@ -35,12 +36,84 @@ def rho0(Nk):
     rho[0,0,:] = 1.
     return rho
 
+@njit
 def Delta(K, rho, Vb, Vc):
     Nk = len(K)
     deltas = [0., 1.]
     phi_b = np.sum(rho[1,0] * np.exp(1j*K * deltas[0]))
     phi_c = np.sum(rho[1,0]  * np.exp(1j*K * deltas[1]))
     return - np.array([Vb * phi_b, Vc * phi_c]) / Nk
+
+def Gap(energije, delta_b, delta_c, Vb, Vc, epsilon_threshold, gap_infty):
+    condition = False
+    if Vb != 0 and Vc != 0:
+        if np.abs(delta_b) < epsilon_threshold and np.abs(delta_c) < epsilon_threshold:
+            condition = True
+    elif Vb != 0 and Vc == 0:
+        if np.abs(delta_b) < epsilon_threshold:
+            condition = True
+    elif Vb == 0 and Vc != 0:
+        if np.abs(delta_c) == 0:
+            condition = True
+    elif Vb == 0 and Vc == 0:
+        condition = True
+    if condition == True:
+        gap = gap_infty
+    else:
+        gap = np.min(energije[1]) - np.max(energije[0])
+    return gap
+
+def Ns(rho, energije_infty, delta_b, delta_c, Vb, Vc, epsilon_threshold, T, mu):
+    Nk = rho.shape[-1]
+    condition = False
+    if Vb != 0 and Vc != 0:
+        if np.abs(delta_b) < epsilon_threshold and np.abs(delta_c) < epsilon_threshold:
+            condition = True
+    elif Vb != 0 and Vc == 0:
+        if np.abs(delta_b) < epsilon_threshold:
+            condition = True
+    elif Vb == 0 and Vc != 0:
+        if np.abs(delta_c) == 0:
+            condition = True
+    elif Vb == 0 and Vc == 0:
+        condition = True
+    if condition == True:
+        rho1 = np.zeros_like(rho)
+        rho1[0,0] = fd(energije_infty[0], mu, T)
+        rho1[1,1] = fd(energije_infty[1], mu, T)
+        n0 = np.sum(rho1[0,0]).real / Nk
+        n1 = np.sum(rho1[1,1]).real / Nk
+    else:
+        n0 = np.sum(rho[0,0]).real / Nk
+        n1 = np.sum(rho[1,1]).real / Nk
+    return n0, n1
+
+# subtract Hartree shift
+def Gap_tilde(rho, phys_parameters):
+    Nk = rho.shape[-1]
+    n0 = np.sum(rho[0,0,:]).real / Nk
+    n1 = np.sum(rho[1,1,:]).real / Nk
+    _, t, t_, _, epsilon, epsilon_, Vb, Vc, _ = phys_parameters
+    gap0 = epsilon + epsilon_ - 2*(t + t_)
+    gaptilde = gap0 + (Vb + Vc) * (n0 - n1)
+    return gaptilde
+
+def Gap_infty(Nk, phys_parameters, parameters1, include_hartree):
+    _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
+    new_parameters1 = parameters1.copy()
+    new_parameters1["eps0"] = 0.
+    m = mt.model(Nk, 0., phys_parameters, new_parameters1, new_parameters1, include_hartree, True)
+    m.GS()
+    hk = m.hk0.copy()
+    if include_hartree == True:
+        hk[0,0,:] += (Vb + Vc) * np.sum(m.rho[1,1,:]) / Nk
+        hk[1,1,:] += (Vb + Vc) * np.sum(m.rho[0,0,:]) / Nk
+    energy_infty = np.zeros((2, Nk))
+    energy_infty[0] = hk[0,0].real
+    energy_infty[1] = hk[1,1].real
+    mu_infty = m.mu
+    gap_infty = np.min(hk[1,1]) - np.max(hk[0,0])
+    return energy_infty, mu_infty, gap_infty
 
 def h_k0(K, phys_parameters):
     _, t, t_, t12, epsilon, epsilon_, _, _, delta = phys_parameters
@@ -129,16 +202,52 @@ def Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0,
     energije, vecs, fs = diagonalize(h_k(K, hk0, rho, phys_parameters, 0., include_hartree), K, T, mu)
     return rho, err, energije, vecs, fs, zasedenost(rho)
 
+def Rho_next_fast(hk0, rho, K, T, mu, phys_parameters, eps0,
+                  N_epsilon, include_hartree, mix=0.5, maxiter_fast=10):
+    for it in range(maxiter_fast):
+        eps = eps0 if it < N_epsilon else 0.
+        hk = h_k(K, hk0, rho, phys_parameters, eps, include_hartree)
+        rho_new, err = F(hk, rho, K, T, mu)
+        rho = mix * rho_new + (1 - mix) * rho
+    n = zasedenost(rho)
+    return rho, n
+
+def Rho_next_full(hk0, rho, K, T, mu, phys_parameters, eps0,
+                  epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5):
+    
+    err = 1.0
+    N_iters = 0
+
+    while err > epsilon_threshold and N_iters < maxiter:
+
+        eps = eps0 if N_iters < N_epsilon else 0.0
+
+        rho_new, err = F(h_k(K, hk0, rho, phys_parameters, eps, include_hartree), rho, K, T, mu)
+
+        rho = mix * rho_new + (1 - mix) * rho
+
+        N_iters += 1
+
+    hk = h_k(K, hk0, rho, phys_parameters, 0.0, include_hartree)
+    rho, _ = F(hk, rho, K, T, mu)
+    energije, vecs, fs = diagonalize(hk, K, T, mu)
+    n = zasedenost(rho)
+    return rho, err, energije, vecs, fs, n
+
+
 def f_newmu(mu, hk0, rho, K, T, phys_parameters, eps0,
-             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5):
-    _, _, _, _, _, n = Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0,
-             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=mix)
+            N_epsilon, include_hartree, mix=0.5, maxiter_fast=10):
+    rho_tmp, n = Rho_next_fast(hk0, rho, K, T, mu, phys_parameters, eps0,
+                               N_epsilon, include_hartree, mix, maxiter_fast=maxiter_fast)
     return n - 1
 
 def NewMu2(mu1, mu2, hk0, rho, K, T, phys_parameters, eps0,
-             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, xtol=1e-10, rtol=1e-10, maxiterbrentq=100):
-    return brentq(f_newmu, mu1, mu2, args=(hk0, rho, K, T, phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, include_hartree, mix), 
-                   xtol=xtol, rtol=rtol, maxiter=maxiterbrentq, full_output=False)
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, xtol=1e-4, rtol=1e-4, maxiterbrentq=50):
+    mu_star = brentq(f_newmu, mu1, mu2, args=(hk0, rho, K, T, phys_parameters, eps0, N_epsilon, include_hartree, mix),
+                     xtol=xtol, rtol=rtol, maxiter=maxiterbrentq)
+    rho_final, err, energije, vecs, fs, n = Rho_next_full(hk0, rho, K, T, mu_star, phys_parameters, eps0, epsilon_threshold, N_epsilon,
+                                                          maxiter, include_hartree, mix=mix)
+    return mu_star, rho_final, err, energije, vecs, fs, n
 
 ''' analytic result for energy bands IF t12 = 0 and delta = 0 and epsilon_ = epsilon '''
 def E_analytic(K, rho, phys_parameters):
@@ -149,7 +258,26 @@ def E_analytic(K, rho, phys_parameters):
     E_plus = (t-t_)*np.cos(K) + np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
     return np.vstack([E_minus, E_plus])
 
-
+@njit(parallel=True, cache=True)
+def energy_average(K, rho, phys_parameters, energije, mu, T):
+    Nk = len(K)
+    _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
+    en = 0.
+    ''' first add average of MF Hamiltonian'''
+    for i in [0, Nk//2]:
+        for orb in range(2):
+            en += fd(energije[orb,i], mu, T) * energije[orb,i]
+    for i in prange(1,Nk//2):
+        for orb in range(2):
+            en += 2 * fd(energije[orb,i], mu, T) * energije[orb,i]
+    ''' then add also constant terms which are discarded in MF '''
+    delta_b, delta_c = Delta(K, rho, Vb, Vc)
+    en += -(Vb + Vc) / Nk * np.sum(rho[0,0]) * np.sum(rho[1,1])
+    if Vb != 0:
+        en += Nk * 1/Vb * np.abs(delta_b)**2
+    if Vc != 0:
+        en += Nk * 1/Vc * np.abs(delta_c)**2
+    return en.real / Nk
 
 # ====== transport ======
 
@@ -177,9 +305,9 @@ def v_analytic(K, rho, phys_parameters):
     return np.vstack([vel_minus, vel_plus])
 
 @njit(cache=True)
-def j_tok(K, phys_parameters, mu):
-    b, t, t_, t12, epsilon, epsilon_, Vb, Vc, delta = phys_parameters
-    pos, kinetic, _ = parameters(b, t, t_, t12, epsilon, epsilon_, Vb, Vc, mu, delta)
+def j_tok(K, phys_parameters):
+    b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
+    pos, kinetic, _ = parameters(b, t, t_, t12, Vb, Vc, delta)
     Nk = len(K)
     j = np.zeros((2, 2, Nk), dtype=np.complex128)
     for line in kinetic:
@@ -189,10 +317,32 @@ def j_tok(K, phys_parameters, mu):
         j[orb1, orb2] += ad
     return j
 
-def input_data(K, phys_parameters, mu):
-    Nk = len(K)
+def j_E_hop(K, phys_parameters, mu, a=1.):
     b, t, t_, t12, epsilon, epsilon_, Vb, Vc, delta = phys_parameters
-    pos, kinetic, interaction = parameters(b, t, t_, t12, epsilon, epsilon_, Vb, Vc, mu, delta)
+    pos, kinetic, _ = parameters(b, t, t_, t12, Vb, Vc, delta)
+    kinetic = list(kinetic)
+    kinetic.append((0, 0, 0, -epsilon - mu))
+    kinetic.append((0, 1, 1, epsilon_ - mu))
+    Nk = len(K)
+    j = np.zeros((2, 2, Nk), dtype=np.complex128)
+    for line in kinetic:
+        x, orb1, orb2, t = line
+        if t == 0: pass
+        else:
+            x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+            for line_ in kinetic:
+                x_, orb1_, orb2_, t_ = line_
+                x_, orb1_, orb2_, t_ = float(x_), int(orb1_), int(orb2_), float(t_)
+                if orb2 == orb1_:
+                    osnova = - 1j / 2 * t * t_ * np.exp(-1j * K * (x + x_) * a)
+                    position = pos[orb1] - pos[orb2_] + (x+x_)*a
+                    j[orb1, orb2_] += osnova * position
+    return j
+
+def input_data(K, phys_parameters):
+    Nk = len(K)
+    b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12,  Vb, Vc, delta)
     geom = dict()
     geom["kinetic"] = kinetic
     geom["interaction"] = interaction
@@ -211,25 +361,8 @@ def input_data(K, phys_parameters, mu):
     phases["kin"] = phases_kin
     return geom, phases
 
-def convolution(g, rho_fft):
-    return np.fft.fftshift(np.fft.ifft(g * rho_fft))
-
-def prepare_densities_fft(rho):
-    rho00 = rho[0,0,:]
-    rho11 = rho[1,1,:]
-    rho01 = rho[0,1,:]
-    rho10 = rho[1,0,:]
-
-    return {
-        "n0": rho00.sum(),
-        "n1": rho11.sum(),
-        "n01" : rho01.sum(),
-        "n10": rho10.sum(),
-        "rho00_fft": np.fft.fft(np.fft.ifftshift(rho00)),
-        "rho11_fft": np.fft.fft(np.fft.ifftshift(rho11)),
-        "rho01_fft": np.fft.fft(np.fft.ifftshift(rho01)),
-        "rho10_fft": np.fft.fft(np.fft.ifftshift(rho10)),
-    }
+def convolution(g, h):
+    return np.fft.fftshift(np.fft.ifft(g * h))
 
 def G_ffts(phases, Nk):
     L = len(phases["kin"])
@@ -244,7 +377,7 @@ def G_ffts(phases, Nk):
             g = np.conj(phases["kin"][l]) * phases["int"][m]
             g_ffts_M4a1[l,m,:] = np.fft.fft(np.fft.ifftshift(g))
             
-            g = np.conj(phases["int"][m]) * phases["kin"][l]
+            g = phases["kin"][l] * np.conj(phases["int"][m])
             g_ffts_M4b1[l,m,:] = np.fft.fft(np.fft.ifftshift(g))
 
             g = phases["int"][m]
@@ -294,18 +427,18 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 M3[orb1,orb2] += -1j * t * V_ * lega * phase_k * n[orb1_] / Nk
 
                 # ---------- M6 ----------
-                suma = np.sum(rho[orb1,orb2,:] * phase_k)
+                suma = np.sum(rho[orb2,orb1,:] * phase_k)
                 M6[orb1_,orb1_] += -1j * t * V_ * lega * suma / Nk
 
                 # ---------- M4a ----------
                 #g = -1j * V_ * lega * np.conj(phase_k) * phases["int"][m]
                 g_fft = -1j * V_ * lega * g_ffts_M4a1[l,m,:] #np.fft.fft(np.fft.ifftshift(g))
                 gh = np.fft.fftshift(
-                        np.fft.ifft(g_fft * rho_fft[(orb1,orb1_)]))
+                        np.fft.ifft(g_fft * rho_fft[(orb1_,orb1)]))
                 M4a[orb1_,orb2] += fk * gh
 
                 # ---------- M4b ----------
-                h = fk * rho[orb1_,orb2,:]
+                h = fk * rho[orb2,orb1_,:]
                 h_fft = np.fft.fft(np.fft.ifftshift(h))
                 g_fft = -1j * V_ * lega * g_ffts_M4b1[l,m,:]
                 #g_fft = np.fft.fft(np.fft.ifftshift(
@@ -321,20 +454,20 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 M3[orb1,orb2] += +1j * t * V_ * lega * phase_k * n[orb1_] / Nk
 
                 # ---------- M6 ----------
-                suma = np.sum(rho[orb1,orb2,:] * phase_k)
+                suma = np.sum(rho[orb2,orb1,:] * phase_k)
                 M6[orb1_,orb1_] += +1j * t * V_ * lega * suma / Nk
 
                 # ---------- M4a ----------
                 #g = +1j * V_ * lega * phases["int"][m]
                 g_fft = +1j * V_ * lega * g_ffts_M4a2[l,m,:] #np.fft.fft(np.fft.ifftshift(g))
                 gh = np.fft.fftshift(
-                        np.fft.ifft(g_fft * rho_fft[(orb1,orb1_)]))
+                        np.fft.ifft(g_fft * rho_fft[(orb1_,orb1)]))
                 M4a[orb1_,orb2] += fk * gh
 
                 # ---------- M4b ----------
                 #g = +1j * V_ * lega * np.conj(phases["int"][m])
                 g_fft = +1j * V_ * lega * g_ffts_M4b2[l,m,:]#np.fft.fft(np.fft.ifftshift(g))
-                h = fk * rho[orb1_,orb2,:]
+                h = fk * rho[orb2,orb1_,:]
                 h_fft = np.fft.fft(np.fft.ifftshift(h))
                 gh = np.fft.fftshift(
                             np.fft.ifft(g_fft * h_fft)
@@ -343,11 +476,150 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
 
     return M3, M6, -M4a, -M4b
 
-def compute_mf_matrices(K, rho, geom, phases, g_ffts):
-    M3, M6, M4a, M4b = compute_all_mf_matrices(K, rho, geom, phases, g_ffts)
-    return M3 + M6 + M4a + M4b
+''' functions mf_matrix1,2,3,4 give exactly the same as function compute_all_mf_matrices,
+but the latter is more convenient (faster if used for multiple calls) because it uses precomputed elements '''
+def mf_matrix1(K, rho, phys_parameters):
+    b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, Vb, Vc, delta)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
 
-@njit
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            suma_n = np.sum(rho[orb1_, orb1_, :])
+                            lega = pos[orb2 ] - pos[orb1_ ] - x_
+                            matrix[orb1, orb2 ] += -1j * t * V_ * lega * np.exp(-1j*K*x) / Nk * suma_n
+
+                        if orb1 == orb2_:
+                            suma_n = np.sum(rho[orb1_, orb1_, :])
+                            lega = pos[orb1] - pos[orb1_] - x_
+                            matrix[orb1, orb2] += 1j * t * V_ * lega * np.exp(-1j*K*x) / Nk * suma_n
+    return matrix
+
+def mf_matrix2(K, rho, phys_parameters):
+    b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, Vb, Vc, delta)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            suma_n = np.sum(rho[orb1, orb2, :] * np.exp(-1j*K*x))
+                            lega = pos[orb2] - pos[orb1_] - x_
+                            matrix[orb1_, orb1_] += -1j * t * V_ * lega / Nk * suma_n
+
+                        if orb1 == orb2_:
+                            suma_n = np.sum(rho[orb1, orb2, :] * np.exp(-1j*K*x))
+                            lega = pos[orb1] - pos[orb1_] - x_
+                            matrix[orb1_, orb1_] += 1j * t * V_ * lega  / Nk * suma_n
+    return matrix
+
+
+def mf_matrix3(K, rho, phys_parameters):
+    b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, Vb, Vc, delta)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    f_k = t * np.exp(-1j*K*x) / Nk
+
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            lega = pos[orb2] - pos[orb1_] - x_
+                            g = -1j * V_ * lega * np.exp(1j*K*x) * np.exp(-1j*K*x_)
+                            h = rho[orb1, orb1_, :]
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+
+                            matrix[orb1_, orb2] +=  f_k * gh
+
+                        if orb1 == orb2_:
+                            lega = pos[orb1] - pos[orb1_] - x_
+                            g = 1j * V_ * lega * np.exp(-1j*K*x_)
+                            h = rho[orb1, orb1_, :]
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+                            matrix[orb1_, orb2] += f_k * gh
+    return -matrix
+
+def mf_matrix4(K, rho, phys_parameters):
+    b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
+    pos, kinetic, interaction = parameters(b, t, t_, t12, Vb, Vc, delta)
+    Nk = len(K)
+    matrix = np.zeros((2, 2, Nk), dtype=np.complex128)
+    for alpha in range(2):
+        for beta in range(2):
+            for line in kinetic:
+                x, orb1, orb2, t = line
+                x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+                if orb1 == orb2 and x == 0: pass
+                if orb1 == alpha and orb2 == beta:
+                    for line_ in interaction:
+                        x_, orb1_, orb2_, V_ = line_
+                        x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
+
+                        if orb2 == orb2_:
+                            lega = pos[orb2] - pos[orb1_] - x_
+                            g = -1j * V_ * lega * np.exp(-1j*K*x) * np.exp(1j*K*x_)
+                            h = t * np.exp(-1j*K*x) * rho[orb1_, orb2, :] / Nk
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+
+                            matrix[orb1, orb1_] +=  gh
+
+                        if orb1 == orb2_:
+                            lega = pos[orb1] - pos[orb1_] - x_
+                            g = 1j * V_ * lega * np.exp(1j*K*x_)
+                            h = t * np.exp(-1j*K*x) * rho[orb1_, orb2, :] / Nk
+
+                            g_fft = np.fft.fft(np.fft.ifftshift(g))
+                            h_fft = np.fft.fft(np.fft.ifftshift(h))
+                            gh = np.fft.ifft(g_fft * h_fft)
+                            gh = np.fft.fftshift(gh)
+                            matrix[orb1, orb1_] += gh
+    return -matrix
+
 def spektralna_k(omega, mu, energije_k, Gamma):
     N_orb = len(energije_k)
     A = np.zeros(N_orb)
@@ -355,7 +627,6 @@ def spektralna_k(omega, mu, energije_k, Gamma):
         A[orb] = -1/np.pi * Gamma / ( (omega - (energije_k[orb] - mu))**2 + Gamma**2 )
     return A
 
-@njit
 def Spektralka(omegas, mu, energije, Gamma):
     Nk = energije.shape[1]
     Nomega = len(omegas)
@@ -743,7 +1014,6 @@ def evolve_rho_kernel(Hk, rho, dt):
 
     return rho_next
 
-@njit
 def relax_rho(rho, rho_eq, dt, Gamma):
     decay = np.exp(-Gamma * dt)
     return rho_eq + decay * (rho - rho_eq)
@@ -797,6 +1067,8 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
     else:
         measure_operators = measure_operators_fixed
 
+    print(Nop)
+
     rho0 = np.copy(rho)
     H0 = h_k(K, hk0, rho0, phys_parameters, 0., include_hartree)
 
@@ -805,8 +1077,8 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
 
     for i in range(N_points):
 
-        if i % 50 == 0:
-            print(i/N_points, flush=True)
+        #if i % 50 == 0:
+        #    print(i/N_points, flush=True)
 
         A_t = A_pulz(i * dt, A0, t0, sigma, Omega)
         A_half = A_pulz(i * dt + dt/2, A0, t0, sigma, Omega)
@@ -912,10 +1184,11 @@ def sum_rule_rhs(tok_tilde, energije, mu, T):
 
     return suma
 
-def integral_sigma_omega(sigma, omega):
-    return np.trapezoid(sigma.real, omega)
-
-
+def integral_omega(integrand, omega):
+    if hasattr(np, "trapezoid"):
+        return np.trapezoid(integrand.real, omega)
+    else:
+        return np.trapz(integrand.real, omega)
 
 ''' this is just helpers to get local maxima and local minima. I use this to get the envelope of the response '''
 def local_minima(arr):
@@ -941,3 +1214,9 @@ def local_maxima(arr):
         indices.append(i)
         vals.append(arr[i])
     return np.array(indices), np.array(vals)
+
+def to_scalar_if_single(x):
+    x = np.asarray(x)
+    if x.size == 1:
+        return float(x.item())
+    return x
