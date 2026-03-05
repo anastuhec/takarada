@@ -341,7 +341,11 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 )
                 M4b[orb1,orb1_] += gh
 
-    return M3 + M6 - M4a - M4b
+    return M3, M6, -M4a, -M4b
+
+def compute_mf_matrices(K, rho, geom, phases, g_ffts):
+    M3, M6, M4a, M4b = compute_all_mf_matrices(K, rho, geom, phases, g_ffts)
+    return M3 + M6 + M4a + M4b
 
 @njit
 def spektralna_k(omega, mu, energije_k, Gamma):
@@ -452,8 +456,8 @@ def rho_operators(K, phys_parameters, include_hartree):
     _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
 
     if include_hartree == True:
-        thetas = np.hstack([[Vb/2, -Vb/2, -Vb/2, -Vb/2],
-                            [Vc/2, -Vc/2, -Vc/2, -Vc/2]])
+        thetas = np.array([Vb/2, -Vb/2, -Vb/2, -Vb/2,
+                            Vc/2, -Vc/2, -Vc/2, -Vc/2])
         if Vc == 0:
             thetas = thetas[:4]
         nus = [0, 1, 2, 3]
@@ -470,7 +474,7 @@ def rho_operators(K, phys_parameters, include_hartree):
     rhos = np.zeros((len(thetas), 2, 2, len(K)), dtype=np.complex128)
     for i, delta in enumerate(deltas):
         for j, nu in enumerate(nus):
-            ind = len(deltas) * i + j
+            ind = len(nus) * i + j
             U_kdelta = np.zeros((2, 2, len(K)), dtype=np.complex128)
             U_kdelta[0,0] = np.exp(-1j*K*delta/2)
             U_kdelta[1,1] = np.exp(1j*K*delta/2)
@@ -489,62 +493,6 @@ this form does not perform well numerically in the omega --> 0 limit '''
 def Pi_bubble0(omega, E_mk, E_nk, Gamma, mu, T):
     return - (fd(E_mk, mu, T) - fd(E_nk, mu, T)) / (omega + E_mk - E_nk + 1j*2*Gamma)
 
-''' susceptibility between U and V, using bubble  Pi0 '''
-@njit(parallel=True, cache=True)
-def chi_UV0(K, mat1, mat2, omegas, energije, mu, T, Gamma):
-    Nk = len(K)
-    Nw = len(omegas)
-    phi = np.zeros(Nw, dtype=np.complex128)
-
-    for iw in prange(Nw):
-        w = omegas[iw]
-        suma_w = 0.0 + 0.0j
-        for m in prange(Nk):
-            for a in range(2):
-                for b in range(2):
-                    if a != b:
-                        suma_w += mat1[a,b,m] * mat2[b,a,m] * Pi_bubble0(w, energije[a,m], energije[b,m], Gamma, mu, T)
-        phi[iw] = suma_w
-    return phi / Nk
-
-''' current-current, current-density, density-density corrections using a simpler bubble (Pi_bubble0, chi_UV0),
-including their corrections '''
-def chi_jrho(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma):
-    thetas = np.diag(thetas)
-
-    Nop = rhos_tilde.shape[0]
-    Nw = len(omegas)
-
-    ''' chi_j_j is bare current-current susceptibility (bubble) '''
-    chi_j_j = chi_UV0(K, tok_tilde, tok_tilde, omegas, energije, mu, T, Gamma)
-
-    ''' below we construct dchi_j_j, which is correction of the bubble,
-    for this we need rho-current and rho-rho susceptibilities in terms of bubbles '''
-    chi_rho_rho = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
-    chi_rho_j = np.zeros((Nop, Nw), dtype=np.complex128)
-    chi_j_rho = np.zeros((Nop, Nw), dtype=np.complex128)
-    for i in range(Nop):
-        chi_rho_j[i] = chi_UV0(K, rhos_tilde[i], tok_tilde, omegas, energije, mu, T, Gamma)
-        chi_j_rho[i] = chi_UV0(K, tok_tilde, rhos_tilde[i], omegas, energije, mu, T, Gamma)
-        for j in range(Nop):
-            chi_rho_rho[i,j] = chi_UV0(K, rhos_tilde[i], rhos_tilde[j], omegas, energije, mu, T, Gamma)
-
-    inverz = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
-    I = np.eye(Nop, dtype=np.complex128)
-    chi_rho_rho_renorm = np.empty_like(chi_rho_rho, dtype=np.complex128)
-    for i in range(Nw):
-        inv = LA.inv(I - chi_rho_rho[:,:,i] @ thetas)
-        inverz[:,:,i] = inv
-        chi_rho_rho_renorm[:,:,i] = inv @ chi_rho_rho[:,:,i]
-
-    dchi_j_j = np.einsum(
-        'aw,ab,bcw,cw->w',
-        chi_rho_j,
-        thetas,
-        inverz,
-        chi_j_rho
-    )
-    return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho, chi_rho_rho_renorm
 
 ''' retarded Green's function '''
 @njit
@@ -590,69 +538,158 @@ def Pi_bubble(omega, E_mk, E_nk, Gamma, mu, T, width, deps):
     chi_nm = chi_nm * deps
     return - chi_mn, - chi_nm
 
+@njit
+def Pi_bubble_tilde(omega, E_mk, E_nk, Gamma, mu_, invt, L, nodes, weights):
+    w = omega / Gamma
+    e_mk = E_mk / Gamma
+    e_nk = E_nk / Gamma
+
+    e_min = min(e_mk, e_nk - w, mu_) - L
+    e_max = max(e_mk, e_nk - w, mu_) + L
+
+    mid = 0.5*(e_max + e_min)
+    half = 0.5*(e_max - e_min)
+    
+    res_mn = 0.0 + 0.0*1j
+    res_nm = 0.0 + 0.0*1j
+
+    res_w_mn = 0.0 + 0.0*1j
+    res_w_nm = 0.0 + 0.0*1j
+
+    invpi = 1. / np.pi
+
+    n_nodes = len(nodes)
+    for i in range(n_nodes):
+        e = mid + half * nodes[i]
+        ew = e + w
+        dm = e - e_mk
+        dn = e - e_nk
+        dmw = dm + w
+        dnw = dn + w
+        pref = e - mu_ + 0.5*w
+
+        weight = weights[i]
+
+        f = 1. / (np.exp((e - mu_) * invt) + 1.)
+        fw = 1. / (np.exp((ew - mu_) * invt) + 1.)
+
+        A_mk = invpi / (dm*dm + 1.)
+        A_nk = invpi / (dn*dn + 1.)
+        A_mkw = invpi / (dmw*dmw + 1.)
+        A_nkw = invpi / (dnw*dnw + 1.)
+
+        Grnw = 1. / (dnw + 1j)
+        Grmw = 1. / (dmw + 1j)
+
+        Gam = 1. / (dm - 1j)
+        Gan = 1. / (dn - 1j)
+
+        inte_mn_e = A_mk * Grnw * f + A_nkw * Gam * fw
+        inte_nm_e = A_nk * Grmw * f + A_mkw * Gan * fw
+    
+    
+        res_mn += - weight * inte_mn_e
+        res_nm += - weight * inte_nm_e
+
+        res_w_mn += - pref * weight * inte_mn_e
+        res_w_nm += - pref * weight * inte_nm_e
+
+    return half * res_mn / Gamma, half * res_nm / Gamma, half * res_w_mn, half * res_w_nm
 
 @njit(parallel=True, cache=True)
-def chi_UV(K, U, V, omegas, energije, Gamma, mu, T, N=15, factor=5):
-    Nk = len(K)
-    Nw = len(omegas)
-    width = N * max(Gamma, T)
-    deps = min(Gamma, T) / factor
-    chi = np.zeros(Nw, dtype=np.complex128)
+def Pi_bubble_tilde_w(Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights):
+    pi = np.zeros((2,2,2,Nk), dtype=np.complex128)
+    pi_eps = np.zeros_like(pi)
 
-    for iw in prange(Nw):
-        w = omegas[iw]
-        for j in range(Nk):
-            for m in range(2):
-                for n in range(m,2):
-                    U_mnk = U[m,n,j]
-                    U_nmk = U[n,m,j]
-                    V_mnk = V[m,n,j]
-                    V_nmk = V[n,m,j]
-                    pi_mnk, pi_nmk = Pi_bubble(w, energije[m,j], energije[n,j], Gamma, mu, T, width, deps)
-                    if m == n:
-                        chi[iw] += 0.5 * (U_mnk * V_nmk * pi_mnk + U_nmk * V_mnk * pi_nmk)
-                    else:
-                        chi[iw] += U_mnk * V_nmk * pi_mnk + U_nmk * V_mnk * pi_nmk
+    for j in prange(Nk):
+        for m in range(2):
+            for n in range(m,2):
+                pi_mnk, pi_nmk, pie_mnk, pie_nmk = Pi_bubble_tilde(omega, energije[m,j], energije[n,j], Gamma, mu_, invt, L, nodes, weights,)
+
+                pi[m,n,0,j] = pi_mnk
+                pi[m,n,1,j] = pi_nmk
+                pi_eps[m,n,0,j] = pie_mnk
+                pi_eps[m,n,1,j] = pie_nmk
+
+    return pi, pi_eps
+
+@njit(parallel=True, cache=True)
+def chi_UV(Nk, U, V, pi_w, pi_eps_w, eps=False):
+    chi = np.complex64(0.0)
+
+    for j in prange(Nk):
+        for m in range(2):
+            for n in range(m,2):
+                
+                U_mn = U[m,n,j]
+                U_nm = U[n,m,j]
+                V_mn = V[m,n,j]
+                V_nm = V[n,m,j]
+
+                if eps:
+                    pi_mn = pi_eps_w[m,n,0,j]
+                    pi_nm = pi_eps_w[m,n,1,j]
+                else:
+                    pi_mn = pi_w[m,n,0,j]
+                    pi_nm = pi_w[m,n,1,j]
+                
+                if m == n:
+                    chi += 0.5 * (U_mn * V_nm * pi_mn + U_nm * V_mn * pi_nm)
+                else:
+                    chi += U_mn * V_nm * pi_mn + U_nm * V_mn * pi_nm
     return chi / Nk
+
+
 ''' current-current, current-density, density-density corrections using a more complicated bubble (Pi_bubble, chi_UV),
 including their corrections '''
-def chi_jrho2(K, tok_tilde, rhos_tilde, thetas, energije, mu, T, omegas, Gamma, N=15, factor=5):
+def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omega, Gamma, L, nodes, weights):
     thetas = np.diag(thetas)
-
     Nop = rhos_tilde.shape[0]
-    Nw = len(omegas)
+    Nk = len(K)
+    mu_ = mu / Gamma
+    invt = Gamma / T
+
+    pi_w, pi_eps_w = Pi_bubble_tilde_w(Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights)
 
     ''' chi_j_j is bare current-current susceptibility (bubble) '''
-    chi_j_j = chi_UV(K, tok_tilde, tok_tilde, omegas, energije, Gamma, mu, T, N, factor)
-
+    chi_j_j = chi_UV(Nk, tok_tilde, tok_tilde, pi_w, pi_eps_w, )
+    chi_jE_j = chi_UV(Nk, tok_tilde, tok_tilde, pi_w, pi_eps_w, eps=True)
+    chi_jE2_j = chi_UV(Nk, mat_tilde, tok_tilde, pi_w, pi_eps_w)
     ''' below we construct dchi_j_j, which is correction of the bubble,
     for this we need rho-current and rho-rho susceptibilities in terms of bubbles '''
-    chi_rho_rho = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
-    chi_rho_j = np.zeros((Nop, Nw), dtype=np.complex128)
-    chi_j_rho = np.zeros((Nop, Nw), dtype=np.complex128)
+    chi_rho_rho = np.zeros((Nop, Nop), dtype=np.complex128)
+    chi_rho_j = np.zeros(Nop, dtype=np.complex128)
+    chi_j_rho = np.zeros(Nop, dtype=np.complex128)
+    chi_jE_rho = np.zeros(Nop, dtype=np.complex128)
+    chi_jE2_rho = np.zeros(Nop, dtype=np.complex128)
     for i in range(Nop):
-        chi_rho_j[i] = chi_UV(K, tok_tilde, rhos_tilde[i], omegas, energije, Gamma, mu, T, N, factor)
-        chi_j_rho[i] = chi_UV(K, rhos_tilde[i], tok_tilde, omegas, energije, Gamma, mu, T, N, factor)
+        chi_rho_j[i] = chi_UV(Nk, rhos_tilde[i], tok_tilde, pi_w, pi_eps_w)
+        chi_j_rho[i] = chi_UV(Nk, tok_tilde, rhos_tilde[i], pi_w, pi_eps_w)
+        chi_jE_rho[i] = chi_UV(Nk, tok_tilde, rhos_tilde[i], pi_w, pi_eps_w, eps=True)
+        chi_jE2_rho[i] = chi_UV(Nk, mat_tilde, rhos_tilde[i], pi_w, pi_eps_w)
         for j in range(Nop):
-            chi_rho_rho[i,j] = chi_UV(K, rhos_tilde[i], rhos_tilde[j], omegas, energije, Gamma, mu, T, N, factor)
+            chi_rho_rho[i,j] = chi_UV(Nk, rhos_tilde[i], rhos_tilde[j], pi_w, pi_eps_w)
 
-    inverz = np.zeros((Nop, Nop, Nw), dtype=np.complex128)
     I = np.eye(Nop, dtype=np.complex128)
-    chi_rho_rho_renorm = np.empty_like(chi_rho_rho, dtype=np.complex128)
-    for i in range(Nw):
-        inv = LA.inv(I - chi_rho_rho[:,:,i] @ thetas)
-        inverz[:,:,i] = inv
-        chi_rho_rho_renorm[:,:,i] = inv @ chi_rho_rho[:,:,i]
+    chi_rho_rho_renorm = np.empty_like(chi_rho_rho, dtype=np.complex64)
+    inv = LA.inv(I - chi_rho_rho @ np.diag(thetas))
+    chi_rho_rho_renorm = inv @ chi_rho_rho
 
-    dchi_j_j = np.einsum(
-        'aw,ab,bcw,cw->w',
-        chi_rho_j,
-        thetas,
-        inverz,
-        chi_j_rho
-    )
-    return chi_j_j, dchi_j_j, chi_rho_rho, chi_rho_j, chi_j_rho, chi_rho_rho_renorm
+    dchi_j_j = chi_j_rho @ thetas @ inv @ chi_rho_j
+    dchi_jE_j = chi_jE_rho @ thetas @ inv @ chi_rho_j
+    dchi_jE2_j = chi_jE2_rho @ thetas @ inv @ chi_rho_j
 
+    results = {'chi_j_j' : chi_j_j,
+               'dchi_j_j' : dchi_j_j, 
+               'chi_rho_j' : chi_rho_j,
+               'chi_j_rho' : chi_j_rho,
+               'chi_jE_j' : chi_jE_j,
+               'dchi_jE_j' : dchi_jE_j,
+               'chi_jE2_j' : chi_jE2_j,
+               'dchi_jE2_j' : dchi_jE2_j
+               }
+
+    return results
 
 
 # ====== response and susceptibility obtained from simulation of a pulse ======
@@ -706,6 +743,11 @@ def evolve_rho_kernel(Hk, rho, dt):
 
     return rho_next
 
+@njit
+def relax_rho(rho, rho_eq, dt, Gamma):
+    decay = np.exp(-Gamma * dt)
+    return rho_eq + decay * (rho - rho_eq)
+
 ''' expectation value of measure_operators when system is described by density matrix rho'''
 @njit(parallel=True)
 def measure(Nk, Nop, measure_operators, rho):
@@ -728,11 +770,14 @@ upon application of a perturbation (generated by perturbation_operator)
 * do_freeze=True means that Hartree-Fock is frozen to its equilibrium value, hence we observe no corrections, e.g., in current-current response
 * do_freeze=False is the opposite; Hartree-Fock is dynamic, i.e. densities respond to perturbations, and in this response the vertex corrections are captured
 '''
-def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree, perturbation_operator, measure_provider,
+def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
+                  perturbation_operator, measure_provider,
                   A0, t0, sigma, Omega, dt, t_max,
-                  do_freeze, Ncorr, tol, geom, phases, g_ffts):
+                  do_freeze, Ncorr, tol, geom, phases, g_ffts, Gamma=0.0):
+
     N_points = int(t_max/dt)
     Nk = len(K)
+    rho_eq = np.copy(rho)
 
     if callable(measure_provider):
         dynamic_measure = True
@@ -751,7 +796,7 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree, perturbation_op
         measure_operators = measure_provider(K, rho, geom, phases, g_ffts)[np.newaxis, ...]
     else:
         measure_operators = measure_operators_fixed
-        
+
     rho0 = np.copy(rho)
     H0 = h_k(K, hk0, rho0, phys_parameters, 0., include_hartree)
 
@@ -759,38 +804,73 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree, perturbation_op
     ts = dt * np.arange(N_points)
 
     for i in range(N_points):
+
         if i % 50 == 0:
             print(i/N_points, flush=True)
 
         A_t = A_pulz(i * dt, A0, t0, sigma, Omega)
         A_half = A_pulz(i * dt + dt/2, A0, t0, sigma, Omega)
 
-        for _ in range(Ncorr):
-            rho_guess = rho
-            if do_freeze:
-                H_k0  = H0
-                H_k1 = H0
-            else:
-                H_k0  = h_k(K, hk0, rho, phys_parameters, 0., include_hartree)
-                rho_hk0 = evolve_rho_kernel(H_k0 - A_t * perturbation_operator, rho, dt)
-                H_k1 = h_k(K, hk0, rho_hk0, phys_parameters, 0., include_hartree)
+        # Hamiltonian at current density
+        if do_freeze:
+            H_k0 = H0
+        else:
+            H_k0 = h_k(K, hk0, rho, phys_parameters, 0., include_hartree)
 
-            H_k12 = 0.5 * (H_k0 + H_k1) - A_half * perturbation_operator
-            rho_new = evolve_rho_kernel(H_k12, rho, dt)
+        # ------------------
+        # Predictor
+        # ------------------
+
+        if Gamma != 0.0:
+            rho_half = relax_rho(rho, rho_eq, dt/2, Gamma)
+            rho_pred = evolve_rho_kernel(H_k0 - A_t * perturbation_operator, rho_half, dt)
+            rho_pred = relax_rho(rho_pred, rho_eq, dt/2, Gamma)
+        else:
+            rho_pred = evolve_rho_kernel(H_k0 - A_t * perturbation_operator, rho, dt)
+
+        if do_freeze:
+            H_k1 = H0
+        else:
+            H_k1 = h_k(K, hk0, rho_pred, phys_parameters, 0., include_hartree)
+
+        rho_guess = rho_pred
+
+        # ------------------
+        # Corrector iteration
+        # ------------------
+
+        for _ in range(Ncorr):
+
+            H_mid = 0.5 * (H_k0 + H_k1) - A_half * perturbation_operator
+
+            if Gamma != 0.0:
+                rho_half = relax_rho(rho, rho_eq, dt/2, Gamma)
+                rho_new = evolve_rho_kernel(H_mid, rho_half, dt)
+                rho_new = relax_rho(rho_new, rho_eq, dt/2, Gamma)
+            else:
+                rho_new = evolve_rho_kernel(H_mid, rho, dt)
 
             err = np.max(np.abs(rho_new - rho_guess))
             rho_guess = rho_new
 
             if err < tol:
                 break
-        
+
+            if not do_freeze:
+                H_k1 = h_k(K, hk0, rho_guess, phys_parameters, 0., include_hartree)
+
         rho = rho_guess
+
+        # ------------------
+        # Measurements
+        # ------------------
+
         if dynamic_measure:
             measure_operators = measure_provider(K, rho, geom, phases, g_ffts)[np.newaxis, ...]
         else:
             measure_operators = measure_operators_fixed
 
-        measurement_t = measure(Nk, Nop, measure_operators, rho_guess) 
+        measurement_t = measure(Nk, Nop, measure_operators, rho)
         rho_expvals[i] = measurement_t
 
     return ts, rho_expvals
