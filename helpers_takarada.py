@@ -2,6 +2,10 @@ import numpy as np
 import scipy.linalg as LA
 from numba import njit, prange
 from scipy.optimize import brentq
+import module_takarada as mt
+from scipy.linalg import expm
+import sys
+sys.path.append("/Users/ana/Desktop/takarada/")
 
 @njit(cache=True)
 def parameters(b, t, t_, t12, Vb, Vc, delta=0):
@@ -1304,7 +1308,5 @@ def local_maxima(arr):
 def to_scalar_if_single(x):
     x = np.asarray(x)
     if x.size == 1:
-        return float(x.item())
-    return x
         return float(x.item())
     return x

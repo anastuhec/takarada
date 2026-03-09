@@ -1,4 +1,6 @@
 import numpy as np
+import sys
+sys.path.append("/Users/ana/Desktop/takarada/")
 import helpers_takarada as ht
 
 ''' Takarada model '''
