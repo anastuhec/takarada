@@ -1,5 +1,5 @@
 import numpy as np
-from helpers_takarada import *
+import helpers_takarada as ht
 
 ''' Takarada model '''
 class model:
@@ -90,7 +90,7 @@ class model:
         self.delta_b, self.delta_c = ht.Delta(self.K, self.rho, Vb, Vc)
         if show_print == None: print(1/T, err, n, self.delta_b.real, self.delta_c.real, flush=True)
 
-    def run_Tdependence(self, betas, stops, Gammas, Nomega, eps, maxbrentq, N, factor, oms, eps_ns=1e-6, evaluate_transport=True):
+    def run_Tdependence(self, betas, stops, Gammas, Nomega, eps, maxbrentq, eps_ns=1e-6, evaluate_transport=True):
         self.Gammas = Gammas
         print('started', flush=True)
         for i, beta in enumerate(betas):
@@ -166,15 +166,7 @@ class model:
                         l12_boltz[g] = K1b / (2 * Gamma)
 
                         ''' from susceptibilities, including vertex corrections '''
-                        results = self.chijrho(T, oms, Gamma, N, factor, self.mu)
-                        l11_0[g] = results["j_j"].imag[0] / oms[0]
-                        l11_corr[g] = results["d_j_j"].imag[0] / oms[0]
 
-                        l12_0[g] = results["jE_j"].imag[0] / oms[0]
-                        l12_corr[g] = results["d_jE_j"].imag[0] / oms[0]
-
-                        l12q_0[g] = results["jE2_j"].imag[0] / oms[0]
-                        l12q_corr[g] = results["d_jE2_j"].imag[0] / oms[0]
 
                     self.L11.append(ht.to_scalar_if_single(l11))
                     self.L12.append(ht.to_scalar_if_single(l12))
@@ -247,4 +239,3 @@ class model:
         l22 = np.pi * ht.integral_omega(epsilons**2 * phi * mfd1, epsilons)
         l12q = np.pi * ht.integral_omega(phiQ * mfd1, epsilons)
         return l11, l12, l22, l12q
-
