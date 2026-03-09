@@ -3,8 +3,6 @@ import scipy.linalg as LA
 from numba import njit, prange
 from scipy.optimize import brentq
 
-# ====== self-consistency calculation ======
-
 @njit(cache=True)
 def parameters(b, t, t_, t12, Vb, Vc, delta=0):
     kinetic = np.array([
@@ -35,14 +33,6 @@ def rho0(Nk):
     rho = np.zeros((2, 2, Nk))
     rho[0,0,:] = 1.
     return rho
-
-@njit
-def Delta(K, rho, Vb, Vc):
-    Nk = len(K)
-    deltas = [0., 1.]
-    phi_b = np.sum(rho[1,0] * np.exp(1j*K * deltas[0]))
-    phi_c = np.sum(rho[1,0]  * np.exp(1j*K * deltas[1]))
-    return - np.array([Vb * phi_b, Vc * phi_c]) / Nk
 
 def Gap(energije, delta_b, delta_c, Vb, Vc, epsilon_threshold, gap_infty):
     condition = False
@@ -130,6 +120,14 @@ def h_k0(K, phys_parameters):
     hk[1,0,:] += ad.conj()
     return hk
 
+@njit
+def Delta(K, rho, Vb, Vc):
+    Nk = len(K)
+    deltas = [0., 1.]
+    phi_b = np.sum(rho[1,0] * np.exp(-1j*K * deltas[0]))
+    phi_c = np.sum(rho[1,0]  * np.exp(-1j*K * deltas[1]))
+    return - np.array([Vb * phi_b, Vc * phi_c]) / Nk
+
 def h_k(K, hk0, rho, phys_parameters, eps0, include_hartree):
     _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
     delta_b, delta_c = Delta(K, rho, Vb, Vc)
@@ -138,9 +136,9 @@ def h_k(K, hk0, rho, phys_parameters, eps0, include_hartree):
     hk = hk0.copy()
 
     # Fock term:
-    delta_k = delta_b + delta_c * np.exp(-1j*K)
-    hk[0,1,:] += delta_k
-    hk[1,0,:] += delta_k.conj()
+    delta_k = delta_b + delta_c * np.exp(1j*K)
+    hk[1,0,:] += delta_k
+    hk[0,1,:] += delta_k.conj()
 
     # Hartree term:
     if include_hartree == True:
@@ -430,14 +428,14 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 suma = np.sum(rho[orb2,orb1,:] * phase_k)
                 M6[orb1_,orb1_] += -1j * t * V_ * lega * suma / Nk
 
-                # ---------- M4a ----------
+                # ---------- M4a ---------- (matrix3)
                 #g = -1j * V_ * lega * np.conj(phase_k) * phases["int"][m]
                 g_fft = -1j * V_ * lega * g_ffts_M4a1[l,m,:] #np.fft.fft(np.fft.ifftshift(g))
                 gh = np.fft.fftshift(
                         np.fft.ifft(g_fft * rho_fft[(orb1_,orb1)]))
                 M4a[orb1_,orb2] += fk * gh
 
-                # ---------- M4b ----------
+                # ---------- M4b ---------- (matrix4)
                 h = fk * rho[orb2,orb1_,:]
                 h_fft = np.fft.fft(np.fft.ifftshift(h))
                 g_fft = -1j * V_ * lega * g_ffts_M4b1[l,m,:]
@@ -475,6 +473,10 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 M4b[orb1,orb1_] += gh
 
     return M3, M6, -M4a, -M4b
+
+def compute_together_mf_matrices(K, rho, geom, phases, g_ffts):
+    m1,m2,m3,m4 = compute_all_mf_matrices(K, rho, geom, phases, g_ffts)
+    return m1 + m2 + m3 + m4
 
 ''' functions mf_matrix1,2,3,4 give exactly the same as function compute_all_mf_matrices,
 but the latter is more convenient (faster if used for multiple calls) because it uses precomputed elements '''
@@ -942,7 +944,6 @@ def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omeg
             chi_rho_rho[i,j] = chi_UV(Nk, rhos_tilde[i], rhos_tilde[j], pi_w, pi_eps_w)
 
     I = np.eye(Nop, dtype=np.complex128)
-    chi_rho_rho_renorm = np.empty_like(chi_rho_rho, dtype=np.complex64)
     inv = LA.inv(I - chi_rho_rho @ np.diag(thetas))
     chi_rho_rho_renorm = inv @ chi_rho_rho
 
@@ -950,14 +951,16 @@ def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omeg
     dchi_jE_j = chi_jE_rho @ thetas @ inv @ chi_rho_j
     dchi_jE2_j = chi_jE2_rho @ thetas @ inv @ chi_rho_j
 
-    results = {'chi_j_j' : chi_j_j,
-               'dchi_j_j' : dchi_j_j, 
-               'chi_rho_j' : chi_rho_j,
-               'chi_j_rho' : chi_j_rho,
-               'chi_jE_j' : chi_jE_j,
-               'dchi_jE_j' : dchi_jE_j,
-               'chi_jE2_j' : chi_jE2_j,
-               'dchi_jE2_j' : dchi_jE2_j
+    results = {'j_j' : chi_j_j,
+               'dj_j' : dchi_j_j, 
+               'rho_j' : chi_rho_j,
+               'j_rho' : chi_j_rho,
+               'jE_j' : chi_jE_j,
+               'djE_j' : dchi_jE_j,
+               'jE2_j' : chi_jE2_j,
+               'djE2_j' : dchi_jE2_j,
+               'rho' : chi_rho_rho,
+               'rho_renorm' : chi_rho_rho_renorm
                }
 
     return results
@@ -968,6 +971,25 @@ def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omeg
 ''' Gaussian pulse modulated by a cosine (in practice, however, I choose Omega=0, i.e. the pulse is a Gaussian ''' 
 def A_pulz(t, A0, t0, sigma, Omega):
     return A0 * np.cos(Omega * t) * np.exp(-(t-t0)**2/(2*sigma**2))
+
+def build_U(H, dt):
+    Nk = H.shape[-1]
+    U = np.empty_like(H)
+    for m in range(Nk):
+        H_m = H[:,:,m]
+        U[:,:,m] = expm(-1j * H_m * dt)
+    return U
+
+@njit(parallel=True)
+def evolve_rho_kernel2(U, rho):
+    Nk = rho.shape[-1]
+    rho_next = np.empty_like(rho)
+
+    for m in prange(Nk):
+        U_m = U[:,:,m]
+        rho_next[:,:,m] = U_m @ rho[:,:,m] @ U_m.conj().T
+
+    return rho_next 
 
 ''' evolving rho(t) into rho(t+dt). for 2-band system, this can be done analytically using decomposition of h_k into a linear combination of Pauli matrices '''
 @njit(parallel=True)
@@ -986,8 +1008,15 @@ def evolve_rho_kernel(Hk, rho, dt):
 
         norm_d = np.sqrt(dx*dx + dy*dy + dz*dz)
 
-        c = np.cos(norm_d * dt)
-        s = np.sin(norm_d * dt) / norm_d
+        if norm_d < 1e-14:
+            c = 1.0
+            s = dt
+        else:
+            c = np.cos(norm_d * dt)
+            s = np.sin(norm_d * dt) / norm_d
+
+        #c = np.cos(norm_d * dt)
+        #s = np.sin(norm_d * dt) / norm_d
 
         # Build U explicitly, using: U = cos(|d_k|dt) - isin(|d_k|dt) d_k*sigma / |d_k|
         U00 = c - 1j * s * dz
@@ -1035,50 +1064,93 @@ def measure(Nk, Nop, measure_operators, rho):
     measurements = measurements_k.sum(axis=1)
     return measurements
 
+@njit(parallel=True)
+def norm(rho):
+    Nk = rho.shape[-1]
+    n = 0.0
+    for m in prange(Nk):
+        n += np.trace(rho[:,:,m])
+    return n.real / Nk
+
 ''' main function which propagates the system and measures observables (measure_provider)
 upon application of a perturbation (generated by perturbation_operator)
 * do_freeze=True means that Hartree-Fock is frozen to its equilibrium value, hence we observe no corrections, e.g., in current-current response
 * do_freeze=False is the opposite; Hartree-Fock is dynamic, i.e. densities respond to perturbations, and in this response the vertex corrections are captured
 '''
+
+def compile_measure_provider(measure_provider):
+
+    if not isinstance(measure_provider, (list, tuple)):
+        measure_provider = [measure_provider]
+
+    static_ops = []
+    dynamic_providers = []
+
+    for item in measure_provider:
+
+        if callable(item):
+            dynamic_providers.append(item)
+
+        else:
+            ops = item
+            if ops.ndim == 3:
+                ops = ops[np.newaxis, ...]
+            static_ops.append(ops)
+
+    return static_ops, dynamic_providers
+
 def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
                   perturbation_operator, measure_provider,
                   A0, t0, sigma, Omega, dt, t_max,
                   do_freeze, Ncorr, tol, geom, phases, g_ffts, Gamma=0.0):
-
+    _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
     N_points = int(t_max/dt)
     Nk = len(K)
     rho_eq = np.copy(rho)
 
-    if callable(measure_provider):
-        dynamic_measure = True
-    else:
-        dynamic_measure = False
-        measure_operators_fixed = measure_provider
-        if measure_operators_fixed.ndim == 3:
-            measure_operators_fixed = measure_operators_fixed[np.newaxis, ...]
+    static_ops, dynamic_providers = compile_measure_provider(measure_provider)
 
-    if dynamic_measure or measure_operators_fixed.ndim == 3:
-        Nop = 1
-    else:
+    ops_list = []
+
+    if len(static_ops) > 0:
+        ops_list.append(np.concatenate(static_ops, axis=0))
+
+    if do_freeze:
+        # evaluate dynamic operators once
+        for p in dynamic_providers:
+            ops = p(K, rho, geom, phases, g_ffts)
+            if ops.ndim == 3:
+                ops = ops[np.newaxis, ...]
+            ops_list.append(ops)
+
+        measure_operators_fixed = np.concatenate(ops_list, axis=0)
         Nop = measure_operators_fixed.shape[0]
 
-    if dynamic_measure:
-        measure_operators = measure_provider(K, rho, geom, phases, g_ffts)[np.newaxis, ...]
     else:
-        measure_operators = measure_operators_fixed
+        # dynamic operators will be recomputed
+        for p in dynamic_providers:
+            ops = p(K, rho, geom, phases, g_ffts)
+            if ops.ndim == 3:
+                ops = ops[np.newaxis, ...]
+            ops_list.append(ops)
 
-    print(Nop)
+        measure_operators = np.concatenate(ops_list, axis=0)
+        Nop = measure_operators.shape[0]
 
     rho0 = np.copy(rho)
     H0 = h_k(K, hk0, rho0, phys_parameters, 0., include_hartree)
 
     rho_expvals = np.zeros((N_points, Nop), dtype=np.complex128)
+    rho_norms = np.zeros(N_points)
+    Delta_bs = np.zeros(N_points, dtype=np.complex128)
+    Delta_cs = np.zeros(N_points, dtype=np.complex128)
+
     ts = dt * np.arange(N_points)
 
     for i in range(N_points):
 
-        #if i % 50 == 0:
-        #    print(i/N_points, flush=True)
+        if i % 50 == 0:
+            print(i/N_points, flush=True)
 
         A_t = A_pulz(i * dt, A0, t0, sigma, Omega)
         A_half = A_pulz(i * dt + dt/2, A0, t0, sigma, Omega)
@@ -1137,15 +1209,29 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
         # Measurements
         # ------------------
 
-        if dynamic_measure:
-            measure_operators = measure_provider(K, rho, geom, phases, g_ffts)[np.newaxis, ...]
-        else:
+        if do_freeze:
             measure_operators = measure_operators_fixed
+
+        else:
+            ops_list = []
+
+            if len(static_ops) > 0:
+                ops_list.append(np.concatenate(static_ops, axis=0))
+
+            for p in dynamic_providers:
+                ops = p(K, rho, geom, phases, g_ffts)
+                if ops.ndim == 3:
+                    ops = ops[np.newaxis, ...]
+                ops_list.append(ops)
+
+            measure_operators = np.concatenate(ops_list, axis=0)
 
         measurement_t = measure(Nk, Nop, measure_operators, rho)
         rho_expvals[i] = measurement_t
+        rho_norms[i] = norm(rho)
+        Delta_bs[i], Delta_cs[i] = Delta(K, rho, Vb, Vc)
 
-    return ts, rho_expvals
+    return ts, rho_expvals, rho_norms, Delta_bs, Delta_cs
 
 ''' susceptibility obtained from temporal response, using Fourier transform. window exp(-eta*t) is applied '''
 def susceptibility(time, signal, probe, eta, omega_cut, Nk):
@@ -1218,5 +1304,7 @@ def local_maxima(arr):
 def to_scalar_if_single(x):
     x = np.asarray(x)
     if x.size == 1:
+        return float(x.item())
+    return x
         return float(x.item())
     return x
