@@ -1,0 +1,78 @@
+U = m.vecs
+energije = m.energije
+
+omega = 0.5
+L = 20
+deg = 180
+nodes,weights= np.polynomial.legendre.leggauss(deg)
+Gamma = 0.001
+mu_ = m.mu / Gamma
+invt = Gamma / m.Ts[-1]
+@njit(parallel=True, cache=True)
+def bubble(Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights):
+    pi = np.zeros((2,2,Nk), dtype=np.complex128)
+
+    for j in prange(Nk):
+        for m in range(2):
+            for n in range(m,2):
+                pi_mnk, pi_nmk,_,_ = Pi_bubble_tilde(omega, energije[m,j], energije[n,j], Gamma, mu_, invt, L, nodes, weights,)
+
+                pi[m,n,j] = pi_mnk
+                pi[n,m,j] = pi_nmk
+
+    return pi
+
+''' construct M and N from U '''
+
+M = np.einsum('uap,wgp->uwagp', U.conj(), U, ).reshape((4, 4, m.Nk))
+N = np.einsum('zap,vgp->agzvp', U, U.conj()).reshape((4, 4, m.Nk))
+
+''' construct Gamma0 '''
+gamma_tilde = np.zeros((4*m.Nk, 4*m.Nk), dtype=np.complex128)
+block1 = (Vb + Vc)*np.ones((m.Nk, m.Nk))
+block2 = np.zeros((m.Nk, m.Nk), dtype=np.complex128)
+
+def V(q, Vb, Vc):
+    return Vb + Vc * np.exp(-1j*q)
+
+for i, k in enumerate(m.K):
+    for j, p in enumerate(m.K):
+        q = k - p
+        block2[i,j] = V(q, Vb, Vc)
+gamma_tilde[:m.Nk, -m.Nk:] = block1
+gamma_tilde[-m.Nk:, :m.Nk] = block1
+gamma_tilde[m.Nk:2*m.Nk, m.Nk:2*m.Nk] = -block2
+gamma_tilde[2*m.Nk:3*m.Nk, 2*m.Nk:3*m.Nk] = -block2.conj()
+
+omegas = np.linspace(0.01, m.gap * 3, 30)
+Sigma_x = np.zeros(len(omegas))
+cols = [colorFader('red', 'green', i/(len(omegas) - 1)) for i in range(len(omegas))]
+for om, omega in enumerate(omegas):
+    print(om)
+    Pi = bubble(m.Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights).reshape((4, m.Nk))
+
+    Pi_tilde = np.einsum('aAk,Ak,Abk->abk', M, Pi, N).reshape((4, 4 * m.Nk))
+    Pi_tilde2 = np.zeros((4 * Nk, 4 * Nk), dtype=np.complex128)
+    for i in range(4):
+        for j in range(4):
+            line = Pi_tilde[i:i+1,j*Nk:(j+1)*Nk][0]
+            np.fill_diagonal(Pi_tilde2[i*Nk:(i+1)*Nk, j*Nk:(j+1)*Nk], line)
+
+    #matrika = np.eye(gamma_tilde.shape[0]) - gamma_tilde @ Pi_tilde2
+    #inverz = LA.inv(matrika)
+    #Gamma_tilde = LA.solve(matrika, gamma_tilde)
+    #Gamma_tilde = inverz @ gamma_tilde
+
+    tok = np.swapaxes(m.tok, 0, 1).flatten()
+    #Tok = (Gamma_tilde @ Pi_tilde2 @ tok).reshape((2,2,Nk))
+
+    Sigma_x[om] = (tok @ Pi_tilde2 @ tok.flatten()).imag / omega
+
+    #plt.plot(tok.real + Tok.flatten().real, label=omega, color=cols[om])
+
+plt.plot(tok.real, color='black', ls='dashed')
+plt.axvline(m.Nk)
+plt.axvline(2*m.Nk)
+plt.axvline(3*m.Nk)
+
+plt.legend()
