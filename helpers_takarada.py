@@ -1,12 +1,3 @@
-import numpy as np
-import scipy.linalg as LA
-from numba import njit, prange
-from scipy.optimize import brentq
-import module_takarada as mt
-from scipy.linalg import expm
-import sys
-sys.path.append("/Users/ana/Desktop/takarada/")
-
 @njit(cache=True)
 def parameters(b, t, t_, t12, Vb, Vc, delta=0):
     kinetic = np.array([
@@ -238,14 +229,16 @@ def Rho_next_full(hk0, rho, K, T, mu, phys_parameters, eps0,
 
 
 def f_newmu(mu, hk0, rho, K, T, phys_parameters, eps0,
-            N_epsilon, include_hartree, mix=0.5, maxiter_fast=10):
-    rho_tmp, n = Rho_next_fast(hk0, rho, K, T, mu, phys_parameters, eps0,
-                               N_epsilon, include_hartree, mix, maxiter_fast=maxiter_fast)
+            epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.50):
+    _, _, _, _, _, n = Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, include_hartree, mix)
+    #rho_tmp, n = Rho_next_fast(hk0, rho, K, T, mu, phys_parameters, eps0,
+    #                           N_epsilon, include_hartree, mix, maxiter_fast=maxiter_fast)
     return n - 1
 
 def NewMu2(mu1, mu2, hk0, rho, K, T, phys_parameters, eps0,
              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, xtol=1e-4, rtol=1e-4, maxiterbrentq=50):
-    mu_star = brentq(f_newmu, mu1, mu2, args=(hk0, rho, K, T, phys_parameters, eps0, N_epsilon, include_hartree, mix),
+    mu_star = brentq(f_newmu, mu1, mu2, args=(hk0, rho, K, T, phys_parameters, eps0,
+                                              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix),
                      xtol=xtol, rtol=rtol, maxiter=maxiterbrentq)
     rho_final, err, energije, vecs, fs, n = Rho_next_full(hk0, rho, K, T, mu_star, phys_parameters, eps0, epsilon_threshold, N_epsilon,
                                                           maxiter, include_hartree, mix=mix)
@@ -919,12 +912,8 @@ def chi_UV(Nk, U, V, pi_w, pi_eps_w, eps=False):
 
 ''' current-current, current-density, density-density corrections using a more complicated bubble (Pi_bubble, chi_UV),
 including their corrections '''
-def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omega, Gamma, L, nodes, weights):
+def chi_jrho2(Nk, Nop, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu_, invt, omega, Gamma, L, nodes, weights):
     thetas = np.diag(thetas)
-    Nop = rhos_tilde.shape[0]
-    Nk = len(K)
-    mu_ = mu / Gamma
-    invt = Gamma / T
 
     pi_w, pi_eps_w = Pi_bubble_tilde_w(Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights)
 
@@ -948,7 +937,9 @@ def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omeg
             chi_rho_rho[i,j] = chi_UV(Nk, rhos_tilde[i], rhos_tilde[j], pi_w, pi_eps_w)
 
     I = np.eye(Nop, dtype=np.complex128)
-    inv = LA.inv(I - chi_rho_rho @ np.diag(thetas))
+    mat = I - chi_rho_rho @ np.diag(thetas)
+    inv = LA.inv(mat)
+    det = LA.det(mat)
     chi_rho_rho_renorm = inv @ chi_rho_rho
 
     dchi_j_j = chi_j_rho @ thetas @ inv @ chi_rho_j
@@ -964,7 +955,8 @@ def chi_jrho2(K, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu, T, omeg
                'jE2_j' : chi_jE2_j,
                'djE2_j' : dchi_jE2_j,
                'rho' : chi_rho_rho,
-               'rho_renorm' : chi_rho_rho_renorm
+               'rho_renorm' : chi_rho_rho_renorm,
+               'det' : det
                }
 
     return results
