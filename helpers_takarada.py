@@ -1,19 +1,32 @@
+import numpy as np
+import scipy.linalg as LA
+from numba import njit, prange
+from scipy.optimize import brentq
+import module_takarada as mt
+from scipy.linalg import expm
+from tqdm import tqdm
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+''' this function is called when I create current operators '''
 @njit(cache=True)
 def parameters(b, t, t_, t12, Vb, Vc, delta=0):
+    ''' delta, orb1, orb2, hopping '''
     kinetic = np.array([
         (1, 0, 0, t),
         (-1, 0, 0, t),
         (1, 1, 1, -t_),
         (-1, 1, 1, -t_),
         (0, 0, 1, t12 + delta),
-        (-1, 0, 1, t12 - delta),
+        #(-1, 0, 1, t12 - delta),
         (0, 1, 0, t12 + delta),
-        (1, 1, 0, t12 - delta),
+        #(1, 1, 0, t12 - delta),
         # onsite energies don't matter for current operators
         #(0, 0, 0, epsilon - mu),
         #(0, 1, 1, epsilon_ - mu) 
     ])
 
+    ''' x, orb1, orb2, interaction '''
     interaction = np.array([
         (0, 0, 1, Vb / 2),
         (0, 1, 0, Vb / 2),
@@ -21,14 +34,17 @@ def parameters(b, t, t_, t12, Vb, Vc, delta=0):
         (-1, 1, 0, Vc / 2)
     ])
 
+    ''' intracell orbital positions. I set r0=0 '''
     pos = np.array([0.0, b])
     return pos, kinetic, interaction
 
+''' zeroth approximation for density matrix: lower band fully occupied '''
 def rho0(Nk):
     rho = np.zeros((2, 2, Nk))
     rho[0,0,:] = 1.
     return rho
 
+''' helper functions to calculate gap, <n0>, <n1> '''
 def Gap(energije, delta_b, delta_c, Vb, Vc, epsilon_threshold, gap_infty):
     condition = False
     if Vb != 0 and Vc != 0:
@@ -100,21 +116,26 @@ def Gap_infty(Nk, phys_parameters, parameters1, include_hartree):
     gap_infty = np.min(hk[1,1]) - np.max(hk[0,0])
     return energy_infty, mu_infty, gap_infty
 
+''' kinetic (fixed) part of the Hamiltonian; for me delta is always zero '''
 def h_k0(K, phys_parameters):
-    _, t, t_, t12, epsilon, epsilon_, _, _, delta = phys_parameters
+    b, t, t_, t12, epsilon, epsilon_, Vb, Vc, delta = phys_parameters
+    
     Nk = len(K)
     hk = np.zeros((2, 2, Nk), dtype=np.complex128)
 
-    # diagonal hopping and on-site energy
-    hk[0,0,:] += 2*t*np.cos(K) - epsilon
-    hk[1,1,:] += -2*t_*np.cos(K) + epsilon_
+    _, kinetic, _ = parameters(b, t, t_, t12, Vb, Vc, delta)
 
-    # off-diagonal hopping
-    ad = (t12+delta) + (t12-delta)*np.exp(1j*K)
-    hk[0,1,:] += ad
-    hk[1,0,:] += ad.conj()
+    for line in kinetic:
+        x, orb1, orb2, t = line
+        x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+        hk[orb1,orb2] += t * np.exp(-1j*K*x)
+
+    hk[0,0] += -epsilon
+    hk[1,1] += epsilon_
+
     return hk
 
+''' amplitudes delta_b, delta_c of the order parameter ( delta_k = delta_b + delta_c * exp(ik) ) '''
 @njit
 def Delta(K, rho, Vb, Vc):
     Nk = len(K)
@@ -123,6 +144,10 @@ def Delta(K, rho, Vb, Vc):
     phi_c = np.sum(rho[1,0]  * np.exp(-1j*K * deltas[1]))
     return - np.array([Vb * phi_b, Vc * phi_c]) / Nk
 
+''' full hamiltonian, built from kinetic part hk0 and the self-energy
+if include_hartree=True, I add also Hartree self-energy,
+if include_hartree=False, I have only Fock (off-diagonal) self-energy.
+a small eps0 is used in first couple of iterations to produce an excitonic state '''
 def h_k(K, hk0, rho, phys_parameters, eps0, include_hartree):
     _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
     delta_b, delta_c = Delta(K, rho, Vb, Vc)
@@ -146,42 +171,109 @@ def h_k(K, hk0, rho, phys_parameters, eps0, include_hartree):
         hk[1,0,:] += - eps0 * np.exp(1j*K)
     return hk
 
+''' diagonalization of the hamiltonian '''
+import numpy as np
+from scipy import linalg as LA
+''' diagonalization of the hamiltonian '''
 def diagonalize(hamiltonian, K, T, mu):
     Nk = len(K)
-    energije, vecs = np.zeros((2,Nk)), np.zeros((2,2,Nk), dtype=np.complex128)
-    fs = np.zeros((2,2,Nk))
 
-    for i in [0, Nk//2]:
-        en, v = LA.eigh(hamiltonian[:,:,i])
-        energije[:,i] = en
-        vecs[:,:,i] = v
-        if T == 0:
-            np.fill_diagonal(fs[:, :, i], np.array([1, 0]))
-        else:
-            np.fill_diagonal(fs[:,:,i], 1/(1 + np.exp((en - mu)/T)))
+    # ── Batch diagonalize unique k-points: i = 0, 1, ..., Nk//2 ──────
+    # hamiltonian: (2, 2, Nk) -> np.linalg.eigh expects (batch, 2, 2)
+    H_batch = hamiltonian.transpose(2, 0, 1)                # (Nk, 2, 2)
+    n_unique = Nk // 2 + 1                                  # indices 0..Nk//2
 
-    for i in range(1, Nk//2):
-        en, v = LA.eigh(hamiltonian[:,:,i])
-        energije[:,i] = en
-        energije[:,-i] = en
-        vecs[:,:,i] = v
-        vecs[:,:,-i] = v.conj()
-        if T == 0:
-            np.fill_diagonal(fs[:, :, i], np.array([1, 0]))
-            np.fill_diagonal(fs[:, :, -i], np.array([1, 0]))
-        else:
-            np.fill_diagonal(fs[:,:,i], 1/(1 + np.exp((en - mu)/T)))
-            np.fill_diagonal(fs[:,:,-i], 1/(1 + np.exp((en - mu)/T)))
+    en_batch, v_batch = np.linalg.eigh(H_batch[:n_unique])  # (n_unique, 2), (n_unique, 2, 2)
+
+    # ── Fill positive/unique half ──────────────────────────────────────
+    energije = np.zeros((2, Nk))
+    vecs     = np.zeros((2, 2, Nk), dtype=np.complex128)
+
+    energije[:, :n_unique] = en_batch.T                     # (2, n_unique)
+    vecs[:, :, :n_unique]  = v_batch.transpose(1, 2, 0)     # (2, 2, n_unique)
+
+    # ── Fill negative half by conjugate symmetry: i -> -i ─────────────
+    # indices 1..Nk//2-1 map to -1..-( Nk//2-1), i.e. Nk-1..Nk//2+1
+    if Nk // 2 - 1 > 0:
+        energije[:, Nk//2+1:] = energije[:, 1:Nk//2][:, ::-1]
+        vecs[:, :, Nk//2+1:]  = vecs[:, :, 1:Nk//2][:, :, ::-1].conj()
+
+    # ── Fermi-Dirac occupation matrices ───────────────────────────────
+    fs = np.zeros((2, 2, Nk))
+
+    if T == 0:
+        fs[0, 0, :] = 1.0
+        fs[1, 1, :] = 0.0
+    else:
+        fs[0, 0, :] = fd(energije[0, :], mu, T)
+        fs[1, 1, :] = fd(energije[1, :], mu, T)
+
+    return energije, vecs, fs
+                       
+def diagonalize_new(hamiltonian, K, T, mu):
+    Nk = len(K)
+    energije = np.zeros((2, Nk))
+    vecs     = np.zeros((2, 2, Nk), dtype=np.complex128)
+    fs       = np.zeros((2, 2, Nk))
+
+    # ── unique indices to diagonalize ──────────────────────────────────
+    # i=0 and i=Nk//2 are their own conjugates; i=1..Nk//2-1 are paired
+    unique_idx = np.array([0, Nk//2] + list(range(1, Nk//2)))  # shape (Nk//2 + 1,)
+
+    # ── batch diagonalize all unique k-points at once ──────────────────
+    # hamiltonian shape: (2, 2, Nk) → select unique → (N_unique, 2, 2)
+    H_unique = hamiltonian[:, :, unique_idx].transpose(2, 0, 1)  # (N_unique, 2, 2)
+
+    en_all, v_all = np.linalg.eigh(H_unique)   # (N_unique, 2), (N_unique, 2, 2)
+
+    # ── Fermi factors ──────────────────────────────────────────────────
+    if T == 0:
+        f_all = np.zeros_like(en_all)
+        f_all[:, 0] = 1.0                                  # lowest band filled
+    else:
+        f_all = 1.0 / (1.0 + np.exp((en_all - mu) / T))   # (N_unique, 2)
+
+    for k, i in enumerate([0, Nk//2]):
+        energije[:, i]  = en_all[k]
+        vecs[:, :, i]   = v_all[k].T          # (2,2)
+        fs[0, 0, i]     = f_all[k, 0]
+        fs[1, 1, i]     = f_all[k, 1]
+
+    # ── assign paired indices i=1..Nk//2-1 ────────────────────────────
+    paired_k   = np.arange(2, len(unique_idx))             # indices into en_all
+    paired_i   = np.arange(1, Nk//2)                       # indices into Nk
+
+    # energies: same for i and -i
+    energije[:, paired_i]  = en_all[paired_k].T            # (2, N_paired)
+    energije[:, -paired_i] = en_all[paired_k].T
+
+    # eigenvectors: v at i, conj(v) at -i
+    # v_all shape (N_unique, 2, 2) → transpose to (2, 2, N_unique)
+    v_paired               = v_all[paired_k].transpose(1, 2, 0)   # (2, 2, N_paired)
+    vecs[:, :,  paired_i]  = v_paired
+    vecs[:, :, -paired_i]  = v_paired.conj()
+
+    # Fermi factors: same for i and -i
+    f_paired               = f_all[paired_k].T             # (2, N_paired)
+    fs[0, 0,  paired_i]    = f_paired[0]
+    fs[1, 1,  paired_i]    = f_paired[1]
+    fs[0, 0, -paired_i]    = f_paired[0]
+    fs[1, 1, -paired_i]    = f_paired[1]
+
     return energije, vecs, fs
 
+''' a single iteration in the self-consistency equation. rho --> rho_new  '''
 def F(hamiltonian, rho, K, T, mu):
     _, vecs, fs = diagonalize(hamiltonian, K, T, mu)
     rho_new = np.einsum('ijk,jmk,mnk->ink', vecs, fs, np.swapaxes(vecs.conj(),0,1))
     return rho_new, np.max(np.abs(rho - rho_new))
 
+''' occupation, which should be 1 '''
 def zasedenost(rho):
     return (np.sum(np.diag(np.einsum('ijk->ij', rho)))/(np.prod(rho.shape[-1]))).real
 
+
+''' various functions for converging the self-consistnecy equation '''
 def Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0,
              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5):
     err, N_iters = 1, 0
@@ -207,18 +299,13 @@ def Rho_next_fast(hk0, rho, K, T, mu, phys_parameters, eps0,
 
 def Rho_next_full(hk0, rho, K, T, mu, phys_parameters, eps0,
                   epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5):
-    
     err = 1.0
     N_iters = 0
 
     while err > epsilon_threshold and N_iters < maxiter:
-
         eps = eps0 if N_iters < N_epsilon else 0.0
-
         rho_new, err = F(h_k(K, hk0, rho, phys_parameters, eps, include_hartree), rho, K, T, mu)
-
         rho = mix * rho_new + (1 - mix) * rho
-
         N_iters += 1
 
     hk = h_k(K, hk0, rho, phys_parameters, 0.0, include_hartree)
@@ -227,18 +314,55 @@ def Rho_next_full(hk0, rho, K, T, mu, phys_parameters, eps0,
     n = zasedenost(rho)
     return rho, err, energije, vecs, fs, n
 
-
+''' functions for determining chemical potential for half-filling '''
 def f_newmu(mu, hk0, rho, K, T, phys_parameters, eps0,
-            epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.50):
+            epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.50, n_target=1.0):
     _, _, _, _, _, n = Rho_next(hk0, rho, K, T, mu, phys_parameters, eps0, epsilon_threshold, N_epsilon, maxiter, include_hartree, mix)
-    #rho_tmp, n = Rho_next_fast(hk0, rho, K, T, mu, phys_parameters, eps0,
-    #                           N_epsilon, include_hartree, mix, maxiter_fast=maxiter_fast)
-    return n - 1
+    return n - n_target
+
+def find_bracket(mu1, mu2, hk0, rho, K, T, phys_parameters, eps0,
+                 epsilon_threshold, N_epsilon, maxiter, include_hartree, mix,
+                 max_expand=20, expand_factor=2.0):
+    """
+    Expand [mu1, mu2] outward until f(mu1) and f(mu2) have opposite signs.
+    """
+    args = (hk0, rho, K, T, phys_parameters, eps0,
+            epsilon_threshold, N_epsilon, maxiter, include_hartree, mix)
+    
+    f1 = f_newmu(mu1, *args)
+    f2 = f_newmu(mu2, *args)
+    
+    center = (mu1 + mu2) / 2.0
+    half_width = (mu2 - mu1) / 2.0
+
+    for i in range(max_expand):
+        if f1 * f2 < 0:
+            return mu1, mu2  # valid bracket found
+        
+        # Expand symmetrically
+        half_width *= expand_factor
+        mu1 = center - half_width
+        mu2 = center + half_width
+        
+        f1 = f_newmu(mu1, *args)
+        f2 = f_newmu(mu2, *args)
+            
+    raise ValueError(
+        f"Could not bracket root after {max_expand} expansions. "
+        f"Last: mu1={mu1:.4f}, f(mu1)={f1:.4f}, mu2={mu2:.4f}, f(mu2)={f2:.4f}"
+    )
 
 def NewMu2(mu1, mu2, hk0, rho, K, T, phys_parameters, eps0,
-             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, xtol=1e-4, rtol=1e-4, maxiterbrentq=50):
+             epsilon_threshold, N_epsilon, maxiter, include_hartree, mix=0.5, xtol=1e-4, rtol=1e-4, maxiterbrentq=50, n_target=1.0):
+    # Auto-fix bracket if needed
+    try:
+        mu1, mu2 = find_bracket(mu1, mu2, hk0, rho, K, T, phys_parameters, eps0,
+                                epsilon_threshold, N_epsilon, maxiter, include_hartree, mix)
+    except ValueError as e:
+        print(f"Warning: {e}")
+        raise
     mu_star = brentq(f_newmu, mu1, mu2, args=(hk0, rho, K, T, phys_parameters, eps0,
-                                              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix),
+                                              epsilon_threshold, N_epsilon, maxiter, include_hartree, mix, n_target),
                      xtol=xtol, rtol=rtol, maxiter=maxiterbrentq)
     rho_final, err, energije, vecs, fs, n = Rho_next_full(hk0, rho, K, T, mu_star, phys_parameters, eps0, epsilon_threshold, N_epsilon,
                                                           maxiter, include_hartree, mix=mix)
@@ -253,6 +377,7 @@ def E_analytic(K, rho, phys_parameters):
     E_plus = (t-t_)*np.cos(K) + np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2 )
     return np.vstack([E_minus, E_plus])
 
+''' expectation value of Hamiltonian. I need this for specific heat and entropy '''
 @njit(parallel=True, cache=True)
 def energy_average(K, rho, phys_parameters, energije, mu, T):
     Nk = len(K)
@@ -274,7 +399,7 @@ def energy_average(K, rho, phys_parameters, energije, mu, T):
         en += Nk * 1/Vc * np.abs(delta_c)**2
     return en.real / Nk
 
-# ====== transport ======
+# ====== below is the transport section ======
 
 ''' operator in band basis obtained from operator in orbital basis '''
 def operator_tilde(op_bare, vecs):
@@ -299,6 +424,7 @@ def v_analytic(K, rho, phys_parameters):
     vel_plus = -(t-t_)*np.sin(K) + (-((t+t_)*np.cos(K) - epsilon)*(t+t_)*np.sin(K) + (1j*np.exp(1j*K) * delta_b * delta_c.conj() ).real ) / np.sqrt( ((t+t_)*np.cos(K) - epsilon)**2 + np.abs(delta_k)**2)
     return np.vstack([vel_minus, vel_plus])
 
+''' current operator '''
 @njit(cache=True)
 def j_tok(K, phys_parameters):
     b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
@@ -308,10 +434,11 @@ def j_tok(K, phys_parameters):
     for line in kinetic:
         x, orb1, orb2, t = line
         x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
-        ad = - 1j * t * np.exp(-1j * K * x) * (pos[orb1 - 1] - pos[orb2 - 1] + x)
+        ad = - 1j * t * np.exp(-1j * K * x) * (pos[orb1] - pos[orb2] + x)
         j[orb1, orb2] += ad
     return j
 
+''' kinetic energy current operator '''
 def j_E_hop(K, phys_parameters, mu, a=1.):
     b, t, t_, t12, epsilon, epsilon_, Vb, Vc, delta = phys_parameters
     pos, kinetic, _ = parameters(b, t, t_, t12, Vb, Vc, delta)
@@ -334,6 +461,7 @@ def j_E_hop(K, phys_parameters, mu, a=1.):
                     j[orb1, orb2_] += osnova * position
     return j
 
+''' below is stuff for mean-field approximation of the non-local interaction current operator '''
 def input_data(K, phys_parameters):
     Nk = len(K)
     b, t, t_, t12, _, _, Vb, Vc, delta = phys_parameters
@@ -425,14 +553,14 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 suma = np.sum(rho[orb2,orb1,:] * phase_k)
                 M6[orb1_,orb1_] += -1j * t * V_ * lega * suma / Nk
 
-                # ---------- M4a ---------- (matrix3)
+                # ---------- M4a ---------- (matrix3) - fourth term in equation
                 #g = -1j * V_ * lega * np.conj(phase_k) * phases["int"][m]
                 g_fft = -1j * V_ * lega * g_ffts_M4a1[l,m,:] #np.fft.fft(np.fft.ifftshift(g))
                 gh = np.fft.fftshift(
                         np.fft.ifft(g_fft * rho_fft[(orb1_,orb1)]))
                 M4a[orb1_,orb2] += fk * gh
 
-                # ---------- M4b ---------- (matrix4)
+                # ---------- M4b ---------- (matrix4) - third term in equation
                 h = fk * rho[orb2,orb1_,:]
                 h_fft = np.fft.fft(np.fft.ifftshift(h))
                 g_fft = -1j * V_ * lega * g_ffts_M4b1[l,m,:]
@@ -452,14 +580,14 @@ def compute_all_mf_matrices(K, rho, geom, phases, g_ffts):
                 suma = np.sum(rho[orb2,orb1,:] * phase_k)
                 M6[orb1_,orb1_] += +1j * t * V_ * lega * suma / Nk
 
-                # ---------- M4a ----------
+                # ---------- M4a ---------- fourth term in equation
                 #g = +1j * V_ * lega * phases["int"][m]
                 g_fft = +1j * V_ * lega * g_ffts_M4a2[l,m,:] #np.fft.fft(np.fft.ifftshift(g))
                 gh = np.fft.fftshift(
                         np.fft.ifft(g_fft * rho_fft[(orb1_,orb1)]))
                 M4a[orb1_,orb2] += fk * gh
 
-                # ---------- M4b ----------
+                # ---------- M4b ---------- third term in equation
                 #g = +1j * V_ * lega * np.conj(phases["int"][m])
                 g_fft = +1j * V_ * lega * g_ffts_M4b2[l,m,:]#np.fft.fft(np.fft.ifftshift(g))
                 h = fk * rho[orb2,orb1_,:]
@@ -497,12 +625,12 @@ def mf_matrix1(K, rho, phys_parameters):
                         if orb2 == orb2_:
                             suma_n = np.sum(rho[orb1_, orb1_, :])
                             lega = pos[orb2 ] - pos[orb1_ ] - x_
-                            matrix[orb1, orb2 ] += -1j * t * V_ * lega * np.exp(-1j*K*x) / Nk * suma_n
+                            matrix[orb1, orb2 ] += -1j * t * V_ * lega * np.exp(-1j * K * x) / Nk * suma_n
 
                         if orb1 == orb2_:
                             suma_n = np.sum(rho[orb1_, orb1_, :])
                             lega = pos[orb1] - pos[orb1_] - x_
-                            matrix[orb1, orb2] += 1j * t * V_ * lega * np.exp(-1j*K*x) / Nk * suma_n
+                            matrix[orb1, orb2] += 1j * t * V_ * lega * np.exp(-1j * K * x) / Nk * suma_n
     return matrix
 
 def mf_matrix2(K, rho, phys_parameters):
@@ -523,12 +651,12 @@ def mf_matrix2(K, rho, phys_parameters):
                         x_, orb1_, orb2_, V_ = float(x_), int(orb1_), int(orb2_), float(V_)
 
                         if orb2 == orb2_:
-                            suma_n = np.sum(rho[orb1, orb2, :] * np.exp(-1j*K*x))
+                            suma_n = np.sum(rho[orb2, orb1, :] * np.exp(-1j*K*x))
                             lega = pos[orb2] - pos[orb1_] - x_
                             matrix[orb1_, orb1_] += -1j * t * V_ * lega / Nk * suma_n
 
                         if orb1 == orb2_:
-                            suma_n = np.sum(rho[orb1, orb2, :] * np.exp(-1j*K*x))
+                            suma_n = np.sum(rho[orb2, orb1, :] * np.exp(-1j*K*x))
                             lega = pos[orb1] - pos[orb1_] - x_
                             matrix[orb1_, orb1_] += 1j * t * V_ * lega  / Nk * suma_n
     return matrix
@@ -547,7 +675,7 @@ def mf_matrix3(K, rho, phys_parameters):
                 x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
                 if orb1 == orb2 and x == 0: pass
                 if orb1 == alpha and orb2 == beta:
-                    f_k = t * np.exp(-1j*K*x) / Nk
+                    f_k = t * np.exp(-1j * K * x) / Nk
 
                     for line_ in interaction:
                         x_, orb1_, orb2_, V_ = line_
@@ -555,8 +683,8 @@ def mf_matrix3(K, rho, phys_parameters):
 
                         if orb2 == orb2_:
                             lega = pos[orb2] - pos[orb1_] - x_
-                            g = -1j * V_ * lega * np.exp(1j*K*x) * np.exp(-1j*K*x_)
-                            h = rho[orb1, orb1_, :]
+                            g = -1j * V_ * lega * np.exp(1j * K * x) * np.exp(-1j * K * x_)
+                            h = rho[orb1_, orb1, :]
 
                             g_fft = np.fft.fft(np.fft.ifftshift(g))
                             h_fft = np.fft.fft(np.fft.ifftshift(h))
@@ -568,8 +696,8 @@ def mf_matrix3(K, rho, phys_parameters):
 
                         if orb1 == orb2_:
                             lega = pos[orb1] - pos[orb1_] - x_
-                            g = 1j * V_ * lega * np.exp(-1j*K*x_)
-                            h = rho[orb1, orb1_, :]
+                            g = 1j * V_ * lega * np.exp(-1j * K * x_)
+                            h = rho[orb1_, orb1, :]
 
                             g_fft = np.fft.fft(np.fft.ifftshift(g))
                             h_fft = np.fft.fft(np.fft.ifftshift(h))
@@ -596,8 +724,8 @@ def mf_matrix4(K, rho, phys_parameters):
 
                         if orb2 == orb2_:
                             lega = pos[orb2] - pos[orb1_] - x_
-                            g = -1j * V_ * lega * np.exp(-1j*K*x) * np.exp(1j*K*x_)
-                            h = t * np.exp(-1j*K*x) * rho[orb1_, orb2, :] / Nk
+                            g = -1j * V_ * lega * np.exp(-1j * K * x) * np.exp(1j * K * x_)
+                            h = t * np.exp(-1j*K*x) * rho[orb2, orb1_, :] / Nk
 
                             g_fft = np.fft.fft(np.fft.ifftshift(g))
                             h_fft = np.fft.fft(np.fft.ifftshift(h))
@@ -609,8 +737,8 @@ def mf_matrix4(K, rho, phys_parameters):
 
                         if orb1 == orb2_:
                             lega = pos[orb1] - pos[orb1_] - x_
-                            g = 1j * V_ * lega * np.exp(1j*K*x_)
-                            h = t * np.exp(-1j*K*x) * rho[orb1_, orb2, :] / Nk
+                            g = 1j * V_ * lega * np.exp(1j * K * x_)
+                            h = t * np.exp(-1j*K*x) * rho[orb2, orb1_, :] / Nk
 
                             g_fft = np.fft.fft(np.fft.ifftshift(g))
                             h_fft = np.fft.fft(np.fft.ifftshift(h))
@@ -619,39 +747,46 @@ def mf_matrix4(K, rho, phys_parameters):
                             matrix[orb1, orb1_] += gh
     return -matrix
 
-def spektralna_k(omega, mu, energije_k, Gamma):
+''' Lorentzian spectral function at fix momentum '''
+@njit
+def spektralna_k(epsilon, mu, energije_k, Gamma):
     N_orb = len(energije_k)
     A = np.zeros(N_orb)
     for orb in range(N_orb):
-        A[orb] = -1/np.pi * Gamma / ( (omega - (energije_k[orb] - mu))**2 + Gamma**2 )
+        A[orb] = 1/np.pi * Gamma / ( (epsilon - (energije_k[orb] - mu))**2 + Gamma**2 )
     return A
 
-def Spektralka(omegas, mu, energije, Gamma):
+''' spectral function for all momenta and an array of epsilons '''
+@njit(parallel=True, cache=True)
+def Spektralka(epsilons, mu, energije, Gamma):
     Nk = energije.shape[1]
-    Nomega = len(omegas)
-    A = np.zeros((Nomega, 2, Nk))
-    for i in prange(Nomega):
+    Nepsilons = len(epsilons)
+    A = np.zeros((Nepsilons, 2, Nk))
+    for i in prange(Nepsilons):
+        eps = epsilons[i]
         for m in range(Nk):
-            A_k = spektralna_k(omegas[i], mu, energije[:,m], Gamma)
+            A_k = spektralna_k(eps, mu, energije[:,m], Gamma)
             A[i,:,m] = A_k
     return A
 
+''' Kubo transport function. I will input mat1=mat2=current '''
 @njit(parallel=True, cache=True)
-def phi_Kubo(K, mat1, mat2, spektralka, omegas):
+def phi_Kubo(K, mat1, mat2, spektralka, epsilons):
     Nk = len(K)
-    phi = np.zeros(len(omegas), dtype=np.complex128)
+    phi = np.zeros(len(epsilons), dtype=np.complex128)
     A = spektralka
 
     for m in [0, Nk//2]:
         for a in range(2):
             for b in range(2):
-                phi += (mat1[a,b,m] * A[:,b,m] * mat2[b,a,m] * A[:,a,m]).real
+                phi += (mat1[a,b,m] * A[:,b,m] * mat2[b,a,m] * A[:,a,m])
     for m in prange(1,Nk//2):
         for a in range(2):
             for b in range(2):
-                phi += 2 * (mat1[a,b,m] * A[:,b,m] * mat2[b,a,m] * A[:,a,m]).real
+                phi += 2 * (mat1[a,b,m] * A[:,b,m] * mat2[b,a,m] * A[:,a,m])
     return phi / Nk
 
+''' same as phi_Kubo, but neglecting overlap of spectral function in different bands '''
 @njit(parallel=True, cache=True)
 def phi_Kubo_diagonal(K, mat1, mat2, spektralka, omegas):
     Nk = len(K)
@@ -670,12 +805,14 @@ def phi_Kubo_diagonal(K, mat1, mat2, spektralka, omegas):
 @njit(cache=True)
 def fd_1(omega, T): return -1/(4*T)/np.cosh(omega/(2*T))**2
 
+''' approximation for Dirac delta function '''
 def delta_approximation(x, width, shape='Gaussian'):
     if shape == 'Gaussian':
         return 1/(2*np.pi*width**2)**0.5 * np.exp(-x**2/(2*width**2))
     elif shape == 'Lorentzian':
         return 1/np.pi * width/(x**2 + width**2)
 
+''' Boltzmann transport function'''
 def phi_Boltzmann(K, rho, phys_parameters, energije, mu, omegas, faktor=0.2, shape='Gaussian'):
     Nk = len(K)
     phi = np.zeros(len(omegas))
@@ -700,273 +837,54 @@ def phi_Boltzmann(K, rho, phys_parameters, energije, mu, omegas, faktor=0.2, sha
                 phi[i] += multiply * delta_approximation(omega - energije[alpha,j] + mu, sigma, shape) * vel[alpha,j]**2
     return phi / Nk
 
+def kahan_sum(vals):
+    total = 0.0
+    c = 0.0
+    for x in vals:
+        y = x - c
+        t = total + y
+        c = (t - total) - y
+        total = t
+    return total
+
 def Kn_boltz(K, energije, mu, T):
-    K0, K1 = 0, 0
     Nk = len(K)
-    vel1 = np.diff(energije[0]) / (K[1] - K[0])
-    vel2 = np.diff(energije[1]) / (K[1] - K[0])
 
-    for j in [0,Nk//2]:
-        K0 += -fd_1(energije[0,j] - mu, T) * vel1[j]**2 - fd_1(energije[1,j] - mu, T) * vel2[j]**2
-        K1 += -fd_1(energije[0,j] - mu, T) * vel1[j]**2 * (energije[0,j] - mu) - fd_1(energije[1,j] - mu, T) * vel2[j]**2 * (energije[1,j] - mu)
+    energije1 = energije[0]
+    energije2 = energije[1]
 
-    for j in range(1,Nk//2):
-        K0 += 2 * (-fd_1(energije[0,j] - mu, T) * vel1[j]**2 - fd_1(energije[1,j] - mu, T) * vel2[j]**2)
-        K1 += 2 * (-fd_1(energije[0,j] - mu, T) * vel1[j]**2 * (energije[0,j] - mu) - fd_1(energije[1,j] - mu, T) * vel2[j]**2 * (energije[1,j] - mu))
+    vel1 = np.diff(energije1) / (K[1] - K[0])
+    vel2 = np.diff(energije2) / (K[1] - K[0])
+
+    energije1 = energije1 - mu
+    energije2 = energije2 - mu
+
+    fd1 = -fd_1(energije1, T)
+    fd2 = -fd_1(energije2, T)
+
+    K0_terms = []
+    K1_terms = []
+
+    for j in [0, Nk//2]:
+        K0_terms.append(fd1[j] * vel1[j]**2)
+        K0_terms.append(fd2[j] * vel2[j]**2)
+        K1_terms.append(fd1[j] * vel1[j]**2 * energije1[j])
+        K1_terms.append(fd2[j] * vel2[j]**2 * energije2[j])
+
+    for j in range(1, Nk//2):
+        K0_terms.append(2 * (fd1[j] * vel1[j]**2 + fd2[j] * vel2[j]**2))
+        K1_terms.append(2 * (fd1[j] * vel1[j]**2 * energije1[j]
+                              + fd2[j] * vel2[j]**2 * energije2[j]))
+
+    K0 = kahan_sum(K0_terms)
+    K1 = kahan_sum(K1_terms)
     return K0 / Nk, K1 / Nk
-
-sigmas = np.zeros((4, 2, 2), dtype=np.complex128)
-sigmas[0] = np.eye(2)
-sigmas[1] = np.array([[0,1],[1,0]])
-sigmas[2] = np.array([[0,-1j], [1j,0]])
-sigmas[3] = np.diag([1,-1])
-
-def rho_operators(K, phys_parameters, include_hartree):
-
-    _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
-
-    if include_hartree == True:
-        thetas = np.array([Vb/2, -Vb/2, -Vb/2, -Vb/2,
-                            Vc/2, -Vc/2, -Vc/2, -Vc/2])
-        if Vc == 0:
-            thetas = thetas[:4]
-        nus = [0, 1, 2, 3]
-    else:
-        thetas = np.array([-Vb/2, -Vb/2, -Vc/2, -Vc/2])
-        if Vc == 0:
-            thetas = thetas[:2]
-        nus = [1, 2]
-
-    if Vc == 0:
-        deltas = [0]
-    else: deltas = [0, 1]
-
-    rhos = np.zeros((len(thetas), 2, 2, len(K)), dtype=np.complex128)
-    for i, delta in enumerate(deltas):
-        for j, nu in enumerate(nus):
-            ind = len(nus) * i + j
-            U_kdelta = np.zeros((2, 2, len(K)), dtype=np.complex128)
-            U_kdelta[0,0] = np.exp(-1j*K*delta/2)
-            U_kdelta[1,1] = np.exp(1j*K*delta/2)
-            Rho = np.einsum('ijx, jl, klx -> ikx', U_kdelta, sigmas[nu], U_kdelta.conj())
-            rhos[ind] = Rho
-    return rhos, thetas
-
-''' Fermi-Dirac function '''
-@njit
-def fd(eps, mu, T):
-    return 1.0 / (np.exp((eps - mu) / T) + 1.0)
-
-''' a bubble (just propagators, no operator vertices attached) needed for susceptibilities
-this form does not perform well numerically in the omega --> 0 limit '''
-@njit(cache=True)
-def Pi_bubble0(omega, E_mk, E_nk, Gamma, mu, T):
-    return - (fd(E_mk, mu, T) - fd(E_nk, mu, T)) / (omega + E_mk - E_nk + 1j*2*Gamma)
-
-
-''' retarded Green's function '''
-@njit
-def G_R(epsilon, E, Gamma):
-    return 1. /(epsilon - E + 1j*Gamma)
-
-''' advanced Green's function '''
-@njit
-def G_A(epsilon, E, Gamma):
-    return 1. /(epsilon - E - 1j*Gamma)
-
-''' (single-particle) spectral function '''
-@njit
-def A_k(epsilon, E, Gamma):
-    return 1/np.pi * Gamma  / ( (epsilon - E)**2 + Gamma**2 )
-
-''' susceptibility between U and V, using bubble  Pi '''
-@njit(cache=True)
-def Pi_bubble(omega, E_mk, E_nk, Gamma, mu, T, width, deps):
-    eps_min = min(E_mk, E_nk - omega, mu) - width
-    eps_max = max(E_mk, E_nk - omega, mu) + width
-    Npts = int((eps_max - eps_min) / deps)
-    chi_mn = 0.0 + 1j*0.0
-    chi_nm = 0.0 + 1j*0.0
-    for i in range(Npts):
-        eps = eps_min + i * deps
-        
-        # first term
-        f = fd(eps, mu, T)
-        # first term, mn
-        chi_mn += A_k(eps, E_mk, Gamma) * G_R(eps + omega, E_nk, Gamma) * f
-        # first term, nm
-        chi_nm += A_k(eps, E_nk, Gamma) * G_R(eps + omega, E_mk, Gamma) * f
-
-        # second term
-        fw = fd(eps + omega, mu, T)
-        # second term, mn
-        chi_mn += A_k(eps + omega, E_nk, Gamma) * G_A(eps, E_mk, Gamma) * fw
-        # second term, nm
-        chi_nm += A_k(eps + omega, E_mk, Gamma) * G_A(eps, E_nk, Gamma) * fw
-
-    chi_mn = chi_mn * deps
-    chi_nm = chi_nm * deps
-    return - chi_mn, - chi_nm
-
-@njit
-def Pi_bubble_tilde(omega, E_mk, E_nk, Gamma, mu_, invt, L, nodes, weights):
-    w = omega / Gamma
-    e_mk = E_mk / Gamma
-    e_nk = E_nk / Gamma
-
-    e_min = min(e_mk, e_nk - w, mu_) - L
-    e_max = max(e_mk, e_nk - w, mu_) + L
-
-    mid = 0.5*(e_max + e_min)
-    half = 0.5*(e_max - e_min)
-    
-    res_mn = 0.0 + 0.0*1j
-    res_nm = 0.0 + 0.0*1j
-
-    res_w_mn = 0.0 + 0.0*1j
-    res_w_nm = 0.0 + 0.0*1j
-
-    invpi = 1. / np.pi
-
-    n_nodes = len(nodes)
-    for i in range(n_nodes):
-        e = mid + half * nodes[i]
-        ew = e + w
-        dm = e - e_mk
-        dn = e - e_nk
-        dmw = dm + w
-        dnw = dn + w
-        pref = e - mu_ + 0.5*w
-
-        weight = weights[i]
-
-        f = 1. / (np.exp((e - mu_) * invt) + 1.)
-        fw = 1. / (np.exp((ew - mu_) * invt) + 1.)
-
-        A_mk = invpi / (dm*dm + 1.)
-        A_nk = invpi / (dn*dn + 1.)
-        A_mkw = invpi / (dmw*dmw + 1.)
-        A_nkw = invpi / (dnw*dnw + 1.)
-
-        Grnw = 1. / (dnw + 1j)
-        Grmw = 1. / (dmw + 1j)
-
-        Gam = 1. / (dm - 1j)
-        Gan = 1. / (dn - 1j)
-
-        inte_mn_e = A_mk * Grnw * f + A_nkw * Gam * fw
-        inte_nm_e = A_nk * Grmw * f + A_mkw * Gan * fw
-    
-    
-        res_mn += - weight * inte_mn_e
-        res_nm += - weight * inte_nm_e
-
-        res_w_mn += - pref * weight * inte_mn_e
-        res_w_nm += - pref * weight * inte_nm_e
-
-    return half * res_mn / Gamma, half * res_nm / Gamma, half * res_w_mn, half * res_w_nm
-
-@njit(parallel=True, cache=True)
-def Pi_bubble_tilde_w(Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights):
-    pi = np.zeros((2,2,2,Nk), dtype=np.complex128)
-    pi_eps = np.zeros_like(pi)
-
-    for j in prange(Nk):
-        for m in range(2):
-            for n in range(m,2):
-                pi_mnk, pi_nmk, pie_mnk, pie_nmk = Pi_bubble_tilde(omega, energije[m,j], energije[n,j], Gamma, mu_, invt, L, nodes, weights,)
-
-                pi[m,n,0,j] = pi_mnk
-                pi[m,n,1,j] = pi_nmk
-                pi_eps[m,n,0,j] = pie_mnk
-                pi_eps[m,n,1,j] = pie_nmk
-
-    return pi, pi_eps
-
-@njit(parallel=True, cache=True)
-def chi_UV(Nk, U, V, pi_w, pi_eps_w, eps=False):
-    chi = np.complex64(0.0)
-
-    for j in prange(Nk):
-        for m in range(2):
-            for n in range(m,2):
-                
-                U_mn = U[m,n,j]
-                U_nm = U[n,m,j]
-                V_mn = V[m,n,j]
-                V_nm = V[n,m,j]
-
-                if eps:
-                    pi_mn = pi_eps_w[m,n,0,j]
-                    pi_nm = pi_eps_w[m,n,1,j]
-                else:
-                    pi_mn = pi_w[m,n,0,j]
-                    pi_nm = pi_w[m,n,1,j]
-                
-                if m == n:
-                    chi += 0.5 * (U_mn * V_nm * pi_mn + U_nm * V_mn * pi_nm)
-                else:
-                    chi += U_mn * V_nm * pi_mn + U_nm * V_mn * pi_nm
-    return chi / Nk
-
-
-''' current-current, current-density, density-density corrections using a more complicated bubble (Pi_bubble, chi_UV),
-including their corrections '''
-def chi_jrho2(Nk, Nop, tok_tilde, rhos_tilde, mat_tilde, thetas, energije, mu_, invt, omega, Gamma, L, nodes, weights):
-    thetas = np.diag(thetas)
-
-    pi_w, pi_eps_w = Pi_bubble_tilde_w(Nk, omega, energije, Gamma, mu_, invt, L, nodes, weights)
-
-    ''' chi_j_j is bare current-current susceptibility (bubble) '''
-    chi_j_j = chi_UV(Nk, tok_tilde, tok_tilde, pi_w, pi_eps_w, )
-    chi_jE_j = chi_UV(Nk, tok_tilde, tok_tilde, pi_w, pi_eps_w, eps=True)
-    chi_jE2_j = chi_UV(Nk, mat_tilde, tok_tilde, pi_w, pi_eps_w)
-    ''' below we construct dchi_j_j, which is correction of the bubble,
-    for this we need rho-current and rho-rho susceptibilities in terms of bubbles '''
-    chi_rho_rho = np.zeros((Nop, Nop), dtype=np.complex128)
-    chi_rho_j = np.zeros(Nop, dtype=np.complex128)
-    chi_j_rho = np.zeros(Nop, dtype=np.complex128)
-    chi_jE_rho = np.zeros(Nop, dtype=np.complex128)
-    chi_jE2_rho = np.zeros(Nop, dtype=np.complex128)
-    for i in range(Nop):
-        chi_rho_j[i] = chi_UV(Nk, rhos_tilde[i], tok_tilde, pi_w, pi_eps_w)
-        chi_j_rho[i] = chi_UV(Nk, tok_tilde, rhos_tilde[i], pi_w, pi_eps_w)
-        chi_jE_rho[i] = chi_UV(Nk, tok_tilde, rhos_tilde[i], pi_w, pi_eps_w, eps=True)
-        chi_jE2_rho[i] = chi_UV(Nk, mat_tilde, rhos_tilde[i], pi_w, pi_eps_w)
-        for j in range(Nop):
-            chi_rho_rho[i,j] = chi_UV(Nk, rhos_tilde[i], rhos_tilde[j], pi_w, pi_eps_w)
-
-    I = np.eye(Nop, dtype=np.complex128)
-    mat = I - chi_rho_rho @ np.diag(thetas)
-    inv = LA.inv(mat)
-    det = LA.det(mat)
-    chi_rho_rho_renorm = inv @ chi_rho_rho
-
-    dchi_j_j = chi_j_rho @ thetas @ inv @ chi_rho_j
-    dchi_jE_j = chi_jE_rho @ thetas @ inv @ chi_rho_j
-    dchi_jE2_j = chi_jE2_rho @ thetas @ inv @ chi_rho_j
-
-    results = {'j_j' : chi_j_j,
-               'dj_j' : dchi_j_j, 
-               'rho_j' : chi_rho_j,
-               'j_rho' : chi_j_rho,
-               'jE_j' : chi_jE_j,
-               'djE_j' : dchi_jE_j,
-               'jE2_j' : chi_jE2_j,
-               'djE2_j' : dchi_jE2_j,
-               'rho' : chi_rho_rho,
-               'rho_renorm' : chi_rho_rho_renorm,
-               'det' : det
-               }
-
-    return results
-
 
 # ====== response and susceptibility obtained from simulation of a pulse ======
 
 ''' Gaussian pulse modulated by a cosine (in practice, however, I choose Omega=0, i.e. the pulse is a Gaussian ''' 
-def A_pulz(t, A0, t0, sigma, Omega):
-    return A0 * np.cos(Omega * t) * np.exp(-(t-t0)**2/(2*sigma**2))
+def A_pulz(t, A0, t0, sigma, Omega0):
+    return A0 * np.cos(Omega0 * t) * np.exp(-(t-t0)**2/(2*sigma**2))
 
 def build_U(H, dt):
     Nk = H.shape[-1]
@@ -1046,7 +964,6 @@ def relax_rho(rho, rho_eq, dt, Gamma):
 ''' expectation value of measure_operators when system is described by density matrix rho'''
 @njit(parallel=True)
 def measure(Nk, Nop, measure_operators, rho):
-    measurements_k = np.zeros((Nop, Nk), dtype=np.complex128)
     measurements_k = np.zeros((Nop, Nk), dtype=np.complex128)
     for j in prange(Nk):
         for n in range(Nop):
@@ -1136,7 +1053,7 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
     rho0 = np.copy(rho)
     H0 = h_k(K, hk0, rho0, phys_parameters, 0., include_hartree)
 
-    rho_expvals = np.zeros((N_points, Nop), dtype=np.complex128)
+    rho_expvals = np.zeros((Nop, N_points), dtype=np.complex128)
     rho_norms = np.zeros(N_points)
     Delta_bs = np.zeros(N_points, dtype=np.complex128)
     Delta_cs = np.zeros(N_points, dtype=np.complex128)
@@ -1223,7 +1140,7 @@ def simulate_pulz(K, hk0, rho, phys_parameters, include_hartree,
             measure_operators = np.concatenate(ops_list, axis=0)
 
         measurement_t = measure(Nk, Nop, measure_operators, rho)
-        rho_expvals[i] = measurement_t
+        rho_expvals[:,i] = measurement_t
         rho_norms[i] = norm(rho)
         Delta_bs[i], Delta_cs[i] = Delta(K, rho, Vb, Vc)
 
@@ -1252,6 +1169,30 @@ def optical_conductivity(time, signal, probe, eta, omega_cut, Nk):
     sigma_omega = signal_omega / (-1j * omega * probe_omega)
 
     return omega, sigma_omega.real
+
+def drude_weight(K, vecs, energije, mu, T, kinetic):
+    Nk = len(K)
+    Norb = energije.shape[0]
+    #build first and second derivatives of kinetic Hamiltonian
+    dH_dk = np.zeros_like(vecs, dtype=np.complex128)
+    d2H_dk2 = np.zeros_like(vecs, dtype=np.complex128)
+    for line in kinetic:
+        x, orb1, orb2, t = line
+        x, orb1, orb2, t = float(x), int(orb1), int(orb2), float(t)
+        dH_dk[orb1,orb2] += -1j * t * x * np.exp(-1j*K*x)
+        d2H_dk2[orb1,orb2] += - t * x**2 * np.exp(-1j*K*x)
+    dH_dk_rotate = operator_tilde(dH_dk, vecs)
+    d2H_dk2_rotate = operator_tilde(d2H_dk2, vecs)
+    drude = 0.0
+    for k in range(Nk):
+        for orb in range(Norb):
+            suma_k = 0.0
+            suma_k += d2H_dk2_rotate[orb,orb,k]
+            for orb_ in range(Norb):
+                if orb != orb_:
+                    suma_k += np.abs(dH_dk_rotate[orb_,orb,k])**2 / (energije[orb,k] - energije[orb_,k])**2
+            drude += suma_k * fd(energije[orb,k], mu, T)
+    return drude
 
 def sum_rule_rhs(tok_tilde, energije, mu, T):
     Nk = tok_tilde.shape[-1]
@@ -1302,3 +1243,449 @@ def to_scalar_if_single(x):
     if x.size == 1:
         return float(x.item())
     return x
+
+def DoS(K, energije, epsilons, mu, tok_tilde, faktor, shape='Gaussian'):
+    Nk = len(K)
+    v_max = np.max(np.abs(tok_tilde))
+    sigma = np.sqrt(v_max * (epsilons[1] - epsilons[0]) * (K[1] - K[0])) * faktor
+    dos = np.zeros((2, len(epsilons)))
+    for k in prange(Nk):
+        for alpha in range(2):
+            dos[alpha] += delta_approximation(epsilons - energije[alpha,k] + mu, sigma, shape) 
+    return dos / Nk
+
+''' Pauli matrices '''
+sigmas = np.zeros((4, 2, 2), dtype=np.complex128)
+sigmas[0] = np.eye(2)
+sigmas[1] = np.array([[0,1],[1,0]])
+sigmas[2] = np.array([[0,-1j], [1j,0]])
+sigmas[3] = np.diag([1,-1])
+
+def rho_operators(K, phys_parameters, include_hartree):
+
+    _, _, _, _, _, _, Vb, Vc, _ = phys_parameters
+
+    if include_hartree == True:
+        thetas = np.array([Vb/2, -Vb/2, -Vb/2, -Vb/2,
+                            Vc/2, -Vc/2, -Vc/2, -Vc/2])
+        if Vc == 0:
+            thetas = thetas[:4]
+        nus = [0, 1, 2, 3]
+    else:
+        thetas = np.array([Vb/2, -Vb/2, -Vc/2, -Vc/2])
+        if Vc == 0:
+            thetas = thetas[:2]
+        nus = [1, 2]
+
+    if Vc == 0:
+        deltas = [0]
+    else: deltas = [0, 1]
+
+    rhos = np.zeros((len(thetas), 2, 2, len(K)), dtype=np.complex128)
+    for i, delta in enumerate(deltas):
+        for j, nu in enumerate(nus):
+            ind = len(nus) * i + j
+            U_kdelta = np.zeros((2, 2, len(K)), dtype=np.complex128)
+            U_kdelta[0,0] = np.exp(-1j*K*delta/2)
+            U_kdelta[1,1] = np.exp(1j*K*delta/2)
+            Rho = np.einsum('ijx, jl, klx -> ikx', U_kdelta, sigmas[nu], U_kdelta.conj())
+            rhos[ind] = Rho
+    return rhos, thetas
+
+''' Fermi-Dirac function '''
+@njit
+def fd(eps, mu, T):
+    return 1.0 / (np.exp((eps - mu) / T) + 1.0)
+
+@njit(cache=True)
+def Pi_bubble_tilde(omega, E_mk, E_nk, Gamma, mu_, invt, nodes, weights, eps=1e-5, n_eps=1.0):
+    w    = omega / Gamma
+    e_mk = E_mk  / Gamma
+    e_nk = E_nk  / Gamma
+    
+    T = Gamma / invt
+    
+    invpi = 1.0 / np.pi
+
+    # Single, T-independent cutoff based on Lorentzian tail
+    # A(e) ~ 1/(pi * e^2) < eps  =>  e > 1/(pi*eps)
+    epsilon_max = np.sqrt(np.abs(np.arccosh(1/(eps*4*T))) * 2 * T) / Gamma * n_eps
+
+    # Three integration intervals, one per peak
+    centers = np.array([e_mk, e_nk - w, mu_])
+
+    # Build, sort, merge intervals (same as your new code)
+    raw = np.empty((3, 2), dtype=np.float64)
+    for c in range(3):
+        raw[c, 0] = centers[c] - epsilon_max
+        raw[c, 1] = centers[c] + epsilon_max
+
+    # Sort by left endpoint
+    for i in range(3):
+        for j in range(i + 1, 3):
+            if raw[j, 0] < raw[i, 0]:
+                raw[i, 0], raw[j, 0] = raw[j, 0], raw[i, 0]
+                raw[i, 1], raw[j, 1] = raw[j, 1], raw[i, 1]
+
+    # Merge overlapping intervals
+    merged  = np.empty((3, 2), dtype=np.float64)
+    merged[0, 0] = raw[0, 0]
+    merged[0, 1] = raw[0, 1]
+    n_merged = 1
+    for i in range(1, 3):
+        if raw[i, 0] <= merged[n_merged - 1, 1]:
+            merged[n_merged - 1, 1] = max(raw[i, 1], merged[n_merged - 1, 1])
+        else:
+            merged[n_merged, 0] = raw[i, 0]
+            merged[n_merged, 1] = raw[i, 1]
+            n_merged += 1
+
+    # Integrate over merged intervals
+    n_nodes  = len(nodes)
+
+    res_mn_r = 0.0; res_mn_i = 0.0
+    res_nm_r = 0.0; res_nm_i = 0.0
+    res_w_mn_r = 0.0; res_w_mn_i = 0.0
+    res_w_nm_r = 0.0; res_w_nm_i = 0.0
+
+    for s in range(n_merged):
+        a    = merged[s, 0]
+        b    = merged[s, 1]
+        mid  = 0.5 * (a + b)
+        half = 0.5 * (b - a)
+
+        for i in range(n_nodes):
+            e   = mid + half * nodes[i]
+            ew  = e + w
+            dm  = e - e_mk
+            dn  = e - e_nk
+            dmw = dm + w
+            dnw = dn + w
+            pref = e - mu_ + 0.5 * w
+            wi   = weights[i] * half
+
+            f  = 1.0 / (np.exp((e  - mu_) * invt) + 1.0)
+            fw = 1.0 / (np.exp((ew - mu_) * invt) + 1.0)
+
+            A_mk  = invpi / (dm  * dm  + 1.0)
+            A_nk  = invpi / (dn  * dn  + 1.0)
+            A_mkw = invpi / (dmw * dmw + 1.0)
+            A_nkw = invpi / (dnw * dnw + 1.0)
+
+            Grnw_r =  dnw / (dnw * dnw + 1.0)
+            Grnw_i = -1.0 / (dnw * dnw + 1.0)
+            Grmw_r =  dmw / (dmw * dmw + 1.0)
+            Grmw_i = -1.0 / (dmw * dmw + 1.0)
+            Gam_r  =  dm  / (dm  * dm  + 1.0)
+            Gam_i  =  1.0 / (dm  * dm  + 1.0)
+            Gan_r  =  dn  / (dn  * dn  + 1.0)
+            Gan_i  =  1.0 / (dn  * dn  + 1.0)
+
+            mn_r = A_mk * Grnw_r * f + A_nkw * Gam_r * fw
+            mn_i = A_mk * Grnw_i * f + A_nkw * Gam_i * fw
+            nm_r = A_nk * Grmw_r * f + A_mkw * Gan_r * fw
+            nm_i = A_nk * Grmw_i * f + A_mkw * Gan_i * fw
+
+            res_mn_r   += wi * mn_r
+            res_mn_i   += wi * mn_i
+            res_nm_r   += wi * nm_r
+            res_nm_i   += wi * nm_i
+            res_w_mn_r += wi * pref * mn_r
+            res_w_mn_i += wi * pref * mn_i
+            res_w_nm_r += wi * pref * nm_r
+            res_w_nm_i += wi * pref * nm_i
+
+    res_mn   = (res_mn_r   + 1j * res_mn_i)   / Gamma
+    res_nm   = (res_nm_r   + 1j * res_nm_i)   / Gamma
+    res_w_mn =  res_w_mn_r + 1j * res_w_mn_i
+    res_w_nm =  res_w_nm_r + 1j * res_w_nm_i
+
+    return res_mn, res_nm, res_w_mn, res_w_nm
+
+@njit(parallel=True, cache=True)
+def precompute_Pi_all(omega, energije, Gamma, mu_, invt, nodes, weights, eps=1e-5):
+    Norb, Nk = energije.shape
+
+    pi_mn  = np.zeros((Norb, Norb, Nk), dtype=np.complex128)
+    pi_nm  = np.zeros((Norb, Norb, Nk), dtype=np.complex128)
+    piw_mn = np.zeros((Norb, Norb, Nk), dtype=np.complex128)
+    piw_nm = np.zeros((Norb, Norb, Nk), dtype=np.complex128)
+
+    for j in prange(Nk):
+        for m in range(Norb):
+            for n in range(m, Norb):
+
+                pi_mnk, pi_nmk, pie_mnk, pie_nmk = Pi_bubble_tilde(omega, energije[m,j], energije[n,j], Gamma, mu_, invt, nodes, weights, eps)
+
+                pi_mn [m, n, j] = pi_mnk
+                pi_nm [m, n, j] = pi_nmk
+                piw_mn[m, n, j] = pie_mnk
+                piw_nm[m, n, j] = pie_nmk
+    return pi_mn, pi_nm, piw_mn, piw_nm
+
+@njit(parallel=True, cache=True)
+def chi_UV(Nk, U, V, pi_mn, pi_nm):
+    Norb = U.shape[-2]
+    chi = 0.0 + 0.0j
+
+    for j in prange(Nk):
+        chi_j = 0.0 + 0.0j
+        for m in range(Norb):
+            for n in range(m, Norb):
+
+                U_mn = U[m, n, j]
+                U_nm = U[n, m, j]
+                V_mn = V[m, n, j]
+                V_nm = V[n, m, j]
+
+                p_mn = pi_mn[m, n, j]  
+                p_nm = pi_nm[m, n, j]
+
+                if m == n:
+                    chi_j += 0.5 * (U_mn * V_nm * p_nm + U_nm * V_mn * p_mn)
+                else:
+                    chi_j += U_mn * V_nm * p_nm + U_nm * V_mn * p_mn
+
+        chi += chi_j
+
+    return chi / Nk
+
+def compute_single_om_fused(
+    om,
+    Nk, Gamma, mu_, invt, nodes, weights,
+    thetas, tok_tilde, mat_tilde,
+    energije,
+    rhos_tilde,
+    gbx=None, omega_bx=None,
+    gby=None, omega_by=None,
+    gcx=None, omega_cx=None,
+    gcy=None, omega_cy=None,
+    eps=1e-5, phonon=None, include_hartree=True, Vb=None, Vc=None, Gamma_ph=None
+):
+    Nop = len(thetas)
+    
+    if not phonon:
+        thetas_diag = np.diag(thetas)
+    else:
+        thetas_diag = np.diag(thetas_phonon(om, include_hartree, Vb, Vc, gbx, omega_bx, gby, omega_by, gcx, omega_cx, gcy, omega_cy, Gamma_ph))
+    I = np.eye(Nop)
+
+    # ── ONE precomputation pass for this omega ──────────────────────────
+    pi_mn, pi_nm, piw_mn, piw_nm = precompute_Pi_all(
+        om, energije, Gamma, mu_, invt, nodes, weights, eps
+    )
+
+    # ── chi0 matrix  (Nop x Nop calls, but now cheap) ──────────────────
+    chi0 = np.zeros((Nop, Nop), dtype=np.complex128)
+    for i in range(Nop):
+        for j in range(Nop):
+            chi0[i, j] = chi_UV(Nk, rhos_tilde[i], rhos_tilde[j], pi_mn, pi_nm)
+
+    # ── chi_jj0 ────────────────────────────────────────────────────────
+    chi_jj0 = chi_UV(Nk, tok_tilde, tok_tilde, pi_mn, pi_nm)
+    chi_jEj0 = chi_UV(Nk, tok_tilde, tok_tilde, piw_mn, piw_nm)
+    chi_matj0 = chi_UV(Nk, mat_tilde, tok_tilde, pi_mn, pi_nm)
+
+    # ── chi_jrho0 / chi_rhoj0 ──────────────────────────────────────────
+    chi_jrho0 = np.zeros(Nop, dtype=np.complex128)
+    chi_rhoj0 = np.zeros(Nop, dtype=np.complex128)
+    chi_jErho0 = np.zeros(Nop, dtype=np.complex128)
+    chi_matrho0 = np.zeros(Nop, dtype=np.complex128)
+    for i in range(Nop):
+        chi_jrho0[i] = chi_UV(Nk, tok_tilde,    rhos_tilde[i], pi_mn, pi_nm)
+        chi_rhoj0[i] = chi_UV(Nk, rhos_tilde[i], tok_tilde,    pi_mn, pi_nm)
+        chi_jErho0[i] = chi_UV(Nk, tok_tilde,    rhos_tilde[i], piw_mn, piw_nm)
+        chi_matrho0[i] = chi_UV(Nk, mat_tilde, rhos_tilde[i], pi_mn, pi_nm)
+
+    # ── RPA ────────────────────────────────────────────────────────────
+    mat     = I - chi0 @ thetas_diag
+    inv     = LA.inv(mat)
+    chi_rpa = inv @ chi0
+    dchi_jj = chi_jrho0 @ thetas_diag @ inv @ chi_rhoj0
+    dchi_jEj = chi_jErho0 @ thetas_diag @ inv @ chi_rhoj0
+    dchi_matj = chi_matrho0 @ thetas_diag @ inv @ chi_rhoj0
+
+    return om, chi0, chi_rpa, chi_jj0, dchi_jj, chi_jEj0, dchi_jEj, chi_matj0, dchi_matj
+
+def compute_chi(
+    omegas,
+    Nk, Gamma, mu_, invt, nodes, weights,
+    thetas, tok_tilde, mat_tilde,
+    energije,
+    rhos_tilde,
+    verbose=True,
+    gbx=None, omega_bx=None,
+    gby=None, omega_by=None,
+    gcx=None, omega_cx=None,
+    gcy=None, omega_cy=None,
+    phonon=False, include_hartree=True,
+    n_workers=None, #None: number of CPU cores, or specify an integer
+    eps=1e-5, Vb=None, Vc=None, Gamma_ph=None
+):
+    omegas = np.asarray(omegas)
+    N_om   = len(omegas)
+    Nop    = len(thetas)
+
+    chi0_arr      = np.zeros((N_om, Nop, Nop), dtype=np.complex128)
+    chi_rpa_arr   = np.zeros((N_om, Nop, Nop), dtype=np.complex128)
+    chi_jj0_arr   = np.zeros(N_om,             dtype=np.complex128)
+    dchi_jj_arr   = np.zeros(N_om,             dtype=np.complex128)
+    chi_matj0_arr = np.zeros(N_om, dtype=np.complex128)
+    chi_jEj0_arr = np.zeros(N_om, dtype=np.complex128)
+    dchi_matj_arr = np.zeros(N_om, dtype=np.complex128)
+    dchi_jEj_arr = np.zeros(N_om, dtype=np.complex128)
+
+    t_total = time.time()
+
+    def _worker(om_idx, om):
+        result = compute_single_om_fused(
+            om,        # om = frequency value, omegas = full array
+            Nk, Gamma, mu_, invt, nodes, weights,
+            thetas, tok_tilde, mat_tilde,
+            energije, rhos_tilde,
+            gbx=gbx, omega_bx=omega_bx, gby=gby, omega_by=omega_by, gcx=gcx, omega_cx=omega_cx, gcy=gcy, omega_cy=omega_cy,
+            eps=eps, phonon=phonon, include_hartree=include_hartree, Vb=Vb, Vc=Vc, Gamma_ph=Gamma_ph
+        )
+        return om_idx, result
+
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(_worker, om_idx, om): om_idx
+            for om_idx, om in enumerate(omegas)
+        }
+
+        with tqdm(total=N_om, desc="omegas", disable=not verbose) as pbar:
+            for future in as_completed(futures):
+                om_idx, result = future.result()
+                om, chi0, chi_rpa, chi_jj0, dchi_jj, chi_jEj0, dchi_jEj, chi_matj0, dchi_matj = result
+
+                chi0_arr[om_idx]      = chi0
+                chi_rpa_arr[om_idx]   = chi_rpa
+                chi_jj0_arr[om_idx]   = chi_jj0
+                dchi_jj_arr[om_idx]   = dchi_jj
+                chi_jEj0_arr[om_idx] = chi_jEj0
+                dchi_jEj_arr[om_idx] = dchi_jEj
+                chi_matj0_arr[om_idx] = chi_matj0
+                dchi_matj_arr[om_idx] = dchi_matj
+
+                if verbose:
+                    print(
+                        f"  [om {om_idx+1}/{N_om}]",
+                        flush=True
+                    )
+                pbar.update(1)
+
+    if verbose:
+        print(f"\nTotal time: {time.time() - t_total:.2f}s")
+
+    results = {'chi0' : chi0_arr,
+               'chi' : chi_rpa_arr,
+
+               'chi_jj0' : chi_jj0_arr,
+               'dchi_jj' : dchi_jj_arr,
+
+               'chi_jEj0' : chi_jEj0_arr,
+               'chi_matj0' : chi_matj0_arr,
+
+               'dchi_matj' : dchi_matj_arr,
+               'dchi_jEj' : dchi_jEj_arr}
+    
+    return results
+
+def find_flat_regime(omegas, chi_omega, window=10):
+    """
+    Find flattest window in dchi_domega, using sliding window in LOG omega space.
+    Relative std (std/|mean|) is minimized in the flat region.
+    """
+    dchi_domega = np.gradient(chi_omega, omegas)
+    n          = len(omegas)
+    rel_std    = np.full(n, np.nan)
+
+    for i in range(n - window):
+        chunk      = dchi_domega[i : i + window]
+        mean       = np.mean(chunk)
+        std        = np.std(chunk)
+        rel_std[i] = std / np.abs(mean)
+
+    # Best window = minimum relative std
+    best_start = np.nanargmin(rel_std)
+    best_end   = best_start + window
+
+    # Expand window outward as long as rel_std stays low
+    threshold = rel_std[best_start] * 3   # allow 3x the minimum rel_std
+    
+    # expand left
+    left = best_start
+    while left > 0 and rel_std[left - 1] < threshold:
+        left -= 1
+    
+    # expand right
+    right = best_end
+    while right < n - window and rel_std[right] < threshold:
+        right += 1
+
+    return left, right
+
+def get_dc_coefficient(omegas, chi_imag, omega_cutoff=None):
+    """
+    Get DC coefficient (alpha = chi_imag / omega as omega -> 0)
+    for log-spaced omega arrays using weighted linear regression.
+    
+    Fits: chi_imag = alpha * omega + beta * omega^3
+    Weights = 1/omega to ensure equal contribution per decade.
+    """
+    
+    # Select low-frequency window
+    if omega_cutoff is None:
+        log_min = np.log10(omegas.min())
+        log_max = np.log10(omegas.max())
+        omega_cutoff = 10 ** (log_min + 0.2 * (log_max - log_min))
+    
+    mask = omegas <= omega_cutoff
+    w    = 1.0 / omegas[mask]          # weights: uniform per decade
+    x    = omegas[mask]
+    y    = chi_imag[mask]
+
+    # Weighted least squares: chi_imag = alpha * omega + beta * omega^3
+    # Design matrix
+    A  = np.column_stack([x, x**3])
+    Aw = A * w[:, None]                # apply weights to rows
+    yw = y * w
+
+    # Solve weighted normal equations
+    coeffs, _, _, _ = np.linalg.lstsq(Aw, yw, rcond=None)
+    alpha, beta = coeffs
+
+    return alpha, beta
+
+# adding phonon
+def D0(omega, omega_ph, Gamma_ph):
+    return 2 * omega_ph / ((omega + 1j * Gamma_ph)**2 - omega_ph**2)
+
+def thetas_phonon(omega, include_hartree, Vb, Vc,
+                  gbx, omega_bx, gby, omega_by, gcx, omega_cx, gcy, omega_cy, Gamma_ph):
+    if include_hartree:
+        thetas = np.zeros(8, dtype=np.complex128)
+        thetas[0] = Vb/2 + Vc/2
+        thetas[3] = Vb + Vc/2
+    else:
+        thetas = np.zeros(4, dtype=np.complex128)
+
+    Dbx = D0(omega, omega_bx, Gamma_ph)
+    Dby = D0(omega, omega_by, Gamma_ph)
+    Dcx = D0(omega, omega_cx, Gamma_ph)
+    Dcy = D0(omega, omega_cy, Gamma_ph)
+
+    if include_hartree:
+        thetas[1] = gbx**2 * Dbx
+        thetas[2] = gby**2 * Dby
+        thetas[5] = gcx**2 * Dcx
+        thetas[6] = gcy**2 * Dcy
+    else:
+        thetas[0] = gbx**2 * Dbx
+        thetas[1] = gby**2 * Dby
+        thetas[2] = gcx**2 * Dcx
+        thetas[3] = gcy**2 * Dcy
+
+    return thetas
